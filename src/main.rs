@@ -4,6 +4,7 @@ use std::path::PathBuf;
 mod app;
 mod diff;
 mod loader;
+mod theme;
 mod tree;
 
 use loader::load_trace;

@@ -10,6 +10,7 @@ use ratatui::prelude::*;
 
 use crate::diff::{compute_diff, DiffKind, DiffResult};
 use crate::loader::Trace;
+use crate::theme::Theme;
 use crate::tree::{ExpansionState, TreeLine, render_value};
 
 /// Which panel is focused in diff mode
@@ -102,6 +103,7 @@ pub fn run(trace: Trace, auto_expand: bool) -> Result<()> {
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
 
     let mut app = App::new(trace, auto_expand);
+    let theme = Theme::default();
 
     // Event loop
     while !app.should_quit {
@@ -175,8 +177,8 @@ pub fn run(trace: Trace, auto_expand: bool) -> Result<()> {
         };
         terminal.draw(|f| {
             header_layout = match app.view_mode {
-                ViewMode::Single => render(f, &app, &tree_lines, viewport_height),
-                ViewMode::Diff { left, right, focus } => render_diff(f, &app, left, right, focus, viewport_height),
+                ViewMode::Single => render(f, &app, &tree_lines, viewport_height, &theme),
+                ViewMode::Diff { left, right, focus } => render_diff(f, &app, left, right, focus, viewport_height, &theme),
             };
         })?;
 
@@ -534,10 +536,20 @@ fn build_header<'a>(
     state_text: &str,
     middle_text: &str,
     diff_btn_text: &str,
-    header_style: ratatui::style::Style,
-    button_style: ratatui::style::Style,
+    theme: &Theme,
 ) -> (ratatui::text::Line<'a>, HeaderLayout) {
+    use ratatui::style::{Modifier, Style};
     use ratatui::text::Span;
+
+    let header_style = Style::default()
+        .bg(theme.header_bg)
+        .fg(theme.header_fg)
+        .add_modifier(Modifier::BOLD);
+
+    let button_style = Style::default()
+        .bg(theme.header_bg)
+        .fg(theme.button_fg)
+        .add_modifier(Modifier::BOLD);
 
     let mut pos = 0;
 
@@ -610,19 +622,9 @@ fn build_header<'a>(
     (header, layout)
 }
 
-fn render(frame: &mut Frame, app: &App, tree_lines: &[TreeLine], viewport_height: usize) -> HeaderLayout {
-    use ratatui::style::{Color, Modifier, Style};
+fn render(frame: &mut Frame, app: &App, tree_lines: &[TreeLine], viewport_height: usize, theme: &Theme) -> HeaderLayout {
+    use ratatui::style::Style;
     use ratatui::text::{Line, Span};
-
-    let header_style = Style::default()
-        .bg(Color::Indexed(56))  // Pastel purple
-        .fg(Color::White)
-        .add_modifier(Modifier::BOLD);
-
-    let button_style = Style::default()
-        .bg(Color::Indexed(56))
-        .fg(Color::Yellow)
-        .add_modifier(Modifier::BOLD);
 
     // Build scroll indicator
     let total_lines = tree_lines.len();
@@ -636,7 +638,7 @@ fn render(frame: &mut Frame, app: &App, tree_lines: &[TreeLine], viewport_height
     let state_text = format!(" State {}/{}{}{} ", app.current_state + 1, app.trace.states.len(), auto_indicator, scroll_info);
     let middle_text = " | ";
 
-    let (header, header_layout) = build_header(&state_text, middle_text, "[diff]", header_style, button_style);
+    let (header, header_layout) = build_header(&state_text, middle_text, "[diff]", theme);
 
     let mut lines: Vec<Line> = vec![header, Line::from("")];
 
@@ -650,13 +652,13 @@ fn render(frame: &mut Frame, app: &App, tree_lines: &[TreeLine], viewport_height
     // Render tree lines with cursor highlighting, diff colors, and syntax highlighting
     for (i, tree_line) in visible_lines {
         let is_selected = i == app.cursor;
-        let bg_color = if is_selected { Some(Color::DarkGray) } else { None };
+        let bg_color = if is_selected { Some(theme.cursor_bg) } else { None };
 
         // Get base diff color
         let diff_color = match tree_line.diff {
-            DiffKind::Added => Some(Color::Green),
-            DiffKind::Removed => Some(Color::Red),
-            DiffKind::Modified => Some(Color::Yellow),
+            DiffKind::Added => Some(theme.diff_added),
+            DiffKind::Removed => Some(theme.diff_removed),
+            DiffKind::Modified => Some(theme.diff_modified),
             DiffKind::Unchanged => None,
         };
 
@@ -727,26 +729,17 @@ fn render_diff(
     right_idx: usize,
     focus: DiffFocus,
     viewport_height: usize,
+    theme: &Theme,
 ) -> HeaderLayout {
-    use ratatui::style::{Color, Modifier, Style};
+    use ratatui::style::Style;
     use ratatui::text::{Line, Span};
     use ratatui::layout::{Layout, Constraint, Direction};
     use ratatui::widgets::{Block, Borders, Paragraph};
 
-    let header_style = Style::default()
-        .bg(Color::Indexed(56))
-        .fg(Color::White)
-        .add_modifier(Modifier::BOLD);
-
-    let button_style = Style::default()
-        .bg(Color::Indexed(56))
-        .fg(Color::Yellow)
-        .add_modifier(Modifier::BOLD);
-
     let state_text = format!(" State {} vs {} ", left_idx + 1, right_idx + 1);
     let middle_text = " | Tab:switch | ";
 
-    let (header, header_layout) = build_header(&state_text, middle_text, "[exit]", header_style, button_style);
+    let (header, header_layout) = build_header(&state_text, middle_text, "[exit]", theme);
 
     // Calculate panel width (half of terminal minus border)
     let area = frame.area();
@@ -777,8 +770,8 @@ fn render_diff(
     frame.render_widget(Paragraph::new(header), main_chunks[0]);
 
     // Style for focused/unfocused borders
-    let focused_style = Style::default().fg(Color::Yellow);
-    let unfocused_style = Style::default().fg(Color::DarkGray);
+    let focused_style = Style::default().fg(theme.focused_border);
+    let unfocused_style = Style::default().fg(theme.unfocused_border);
 
     let left_border_style = if focus == DiffFocus::Left { focused_style } else { unfocused_style };
     let right_border_style = if focus == DiffFocus::Right { focused_style } else { unfocused_style };
@@ -791,7 +784,7 @@ fn render_diff(
         .take(viewport_height)
         .map(|(i, tree_line)| {
             let is_cursor = focus == DiffFocus::Left && i == app.cursor;
-            let bg_color = if is_cursor { Some(Color::DarkGray) } else { None };
+            let bg_color = if is_cursor { Some(theme.cursor_bg) } else { None };
             let styled_spans: Vec<Span> = tree_line.spans.iter().map(|span| {
                 let mut style = Style::default();
                 if let Some(bg) = bg_color {
@@ -811,11 +804,11 @@ fn render_diff(
         .take(viewport_height)
         .map(|(i, tree_line)| {
             let is_cursor = focus == DiffFocus::Right && i == app.cursor;
-            let bg_color = if is_cursor { Some(Color::DarkGray) } else { None };
+            let bg_color = if is_cursor { Some(theme.cursor_bg) } else { None };
             let diff_color = match tree_line.diff {
-                DiffKind::Added => Some(Color::Green),
-                DiffKind::Removed => Some(Color::Red),
-                DiffKind::Modified => Some(Color::Yellow),
+                DiffKind::Added => Some(theme.diff_added),
+                DiffKind::Removed => Some(theme.diff_removed),
+                DiffKind::Modified => Some(theme.diff_modified),
                 DiffKind::Unchanged => None,
             };
             let styled_spans: Vec<Span> = tree_line.spans.iter().map(|span| {
