@@ -91,6 +91,7 @@ impl ExpansionState {
 }
 
 /// A single line in the rendered tree
+#[derive(Clone)]
 pub struct TreeLine {
     pub path: NodePath,
     pub text: String,

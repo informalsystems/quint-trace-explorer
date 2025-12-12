@@ -12,6 +12,20 @@ use crate::diff::{compute_diff, DiffKind, DiffResult};
 use crate::loader::Trace;
 use crate::tree::{ExpansionState, TreeLine, render_value};
 
+/// Which panel is focused in diff mode
+#[derive(Clone, Copy, PartialEq)]
+pub enum DiffFocus {
+    Left,
+    Right,
+}
+
+/// View mode for the application
+#[derive(Clone, Copy, PartialEq)]
+pub enum ViewMode {
+    Single,
+    Diff { left: usize, right: usize, focus: DiffFocus },
+}
+
 /// Application state
 pub struct App {
     pub trace: Trace,
@@ -21,6 +35,7 @@ pub struct App {
     pub cursor: usize,  // Which line is selected
     pub scroll_offset: usize,  // First visible line
     pub auto_expand: bool,  // Auto-expand changed variables on state navigation
+    pub view_mode: ViewMode,
 }
 
 impl App {
@@ -33,6 +48,33 @@ impl App {
             cursor: 0,
             scroll_offset: 0,
             auto_expand,
+            view_mode: ViewMode::Single,
+        }
+    }
+
+    /// Enter diff mode comparing current state with previous
+    pub fn enter_diff_mode(&mut self) {
+        let right = self.current_state;
+        let left = if right > 0 { right - 1 } else { 0 };
+        self.view_mode = ViewMode::Diff { left, right, focus: DiffFocus::Right };
+    }
+
+    /// Exit diff mode
+    pub fn exit_diff_mode(&mut self) {
+        if let ViewMode::Diff { right, .. } = self.view_mode {
+            self.current_state = right;
+        }
+        self.view_mode = ViewMode::Single;
+    }
+
+    /// Toggle focus in diff mode
+    pub fn toggle_diff_focus(&mut self) {
+        if let ViewMode::Diff { left, right, focus } = self.view_mode {
+            let new_focus = match focus {
+                DiffFocus::Left => DiffFocus::Right,
+                DiffFocus::Right => DiffFocus::Left,
+            };
+            self.view_mode = ViewMode::Diff { left, right, focus: new_focus };
         }
     }
 
@@ -67,15 +109,54 @@ pub fn run(trace: Trace, auto_expand: bool) -> Result<()> {
         let terminal_size = terminal.size()?;
         let terminal_width = terminal_size.width as usize;
         let terminal_height = terminal_size.height as usize;
-        // Viewport height = terminal height - header (1 line) - blank line (1 line)
-        let viewport_height = terminal_height.saturating_sub(2);
+        // Viewport height depends on view mode
+        // Single: terminal height - header (1) - blank line (1)
+        // Diff: terminal height - header (1) - blank line (1) - panel borders (2)
+        let viewport_height = match app.view_mode {
+            ViewMode::Single => terminal_height.saturating_sub(2),
+            ViewMode::Diff { .. } => terminal_height.saturating_sub(4),
+        };
 
-        // Compute diff with previous state
-        let diff = compute_diff_for_state(&app);
+        // Build tree lines based on view mode
+        // tree_lines: used for cursor navigation and Enter toggle
+        // all_expandable_paths: used for expand_all (includes both panels in diff mode)
+        let (tree_lines, line_count, all_expandable_paths) = match app.view_mode {
+            ViewMode::Single => {
+                let diff = compute_diff_for_state(&app);
+                let lines = build_tree_lines(&app, &diff, terminal_width);
+                let count = lines.len();
+                let paths: Vec<_> = lines.iter()
+                    .filter(|l| l.expandable)
+                    .map(|l| l.path.clone())
+                    .collect();
+                (lines, count, paths)
+            }
+            ViewMode::Diff { left, right, focus } => {
+                // In diff mode, use focused panel's lines for navigation
+                let empty_diff = DiffResult { changes: std::collections::HashMap::new() };
+                let panel_width = terminal_width / 2;
+                let left_lines = build_tree_lines_for_state(&app.trace, left, &app.expansion, &empty_diff, panel_width);
+                let right_lines = build_tree_lines_for_state(&app.trace, right, &app.expansion, &empty_diff, panel_width);
 
-        // Build tree lines for current state
-        let tree_lines = build_tree_lines(&app, &diff, terminal_width);
-        let line_count = tree_lines.len();
+                // Use focused panel for cursor navigation
+                let focused_lines = match focus {
+                    DiffFocus::Left => left_lines.clone(),
+                    DiffFocus::Right => right_lines.clone(),
+                };
+                let count = focused_lines.len();
+
+                // Combine paths from both panels for expand_all
+                let mut all_paths: Vec<_> = left_lines.iter()
+                    .filter(|l| l.expandable)
+                    .map(|l| l.path.clone())
+                    .collect();
+                all_paths.extend(right_lines.iter()
+                    .filter(|l| l.expandable)
+                    .map(|l| l.path.clone()));
+
+                (focused_lines, count, all_paths)
+            }
+        };
 
         // Ensure cursor stays within bounds
         if app.cursor >= line_count && line_count > 0 {
@@ -90,82 +171,162 @@ pub fn run(trace: Trace, auto_expand: bool) -> Result<()> {
             next_start: 0, next_end: 0,
             expand_start: 0, expand_end: 0,
             collapse_start: 0, collapse_end: 0,
+            diff_start: 0, diff_end: 0,
         };
         terminal.draw(|f| {
-            header_layout = render(f, &app, &tree_lines, viewport_height);
+            header_layout = match app.view_mode {
+                ViewMode::Single => render(f, &app, &tree_lines, viewport_height),
+                ViewMode::Diff { left, right, focus } => render_diff(f, &app, left, right, focus, viewport_height),
+            };
         })?;
 
         match event::read()? {
             Event::Key(key) if key.kind == KeyEventKind::Press => {
-                match key.code {
-                    KeyCode::Char('q') | KeyCode::Esc => app.should_quit = true,
-                    KeyCode::Left => {
-                        if app.current_state > 0 {
-                            app.current_state -= 1;
-                            app.cursor = 0;
-                            app.scroll_offset = 0;
-                            if app.auto_expand {
-                                auto_expand_changes(&mut app);
+                match app.view_mode {
+                    ViewMode::Single => {
+                        match key.code {
+                            KeyCode::Char('q') | KeyCode::Esc => app.should_quit = true,
+                            KeyCode::Char('d') => app.enter_diff_mode(),
+                            KeyCode::Left => {
+                                if app.current_state > 0 {
+                                    app.current_state -= 1;
+                                    app.cursor = 0;
+                                    app.scroll_offset = 0;
+                                    if app.auto_expand {
+                                        auto_expand_changes(&mut app);
+                                    }
+                                }
                             }
-                        }
-                    }
-                    KeyCode::Right => {
-                        if app.current_state + 1 < app.trace.states.len() {
-                            app.current_state += 1;
-                            app.cursor = 0;
-                            app.scroll_offset = 0;
-                            if app.auto_expand {
-                                auto_expand_changes(&mut app);
+                            KeyCode::Right => {
+                                if app.current_state + 1 < app.trace.states.len() {
+                                    app.current_state += 1;
+                                    app.cursor = 0;
+                                    app.scroll_offset = 0;
+                                    if app.auto_expand {
+                                        auto_expand_changes(&mut app);
+                                    }
+                                }
                             }
-                        }
-                    }
-                    KeyCode::Up => {
-                        if app.cursor > 0 {
-                            app.cursor -= 1;
-                        }
-                    }
-                    KeyCode::Down => {
-                        if app.cursor + 1 < line_count {
-                            app.cursor += 1;
-                        }
-                    }
-                    KeyCode::PageUp => {
-                        // Move cursor up by viewport height
-                        app.cursor = app.cursor.saturating_sub(viewport_height.saturating_sub(2));
-                    }
-                    KeyCode::PageDown => {
-                        // Move cursor down by viewport height
-                        app.cursor = (app.cursor + viewport_height.saturating_sub(2)).min(line_count.saturating_sub(1));
-                    }
-                    KeyCode::Home => {
-                        app.cursor = 0;
-                    }
-                    KeyCode::End => {
-                        if line_count > 0 {
-                            app.cursor = line_count - 1;
-                        }
-                    }
-                    KeyCode::Enter => {
-                        if let Some(line) = tree_lines.get(app.cursor) {
-                            if line.expandable {
-                                app.expansion.toggle(&line.path);
+                            KeyCode::Up => {
+                                if app.cursor > 0 {
+                                    app.cursor -= 1;
+                                }
                             }
+                            KeyCode::Down => {
+                                if app.cursor + 1 < line_count {
+                                    app.cursor += 1;
+                                }
+                            }
+                            KeyCode::PageUp => {
+                                app.cursor = app.cursor.saturating_sub(viewport_height.saturating_sub(2));
+                            }
+                            KeyCode::PageDown => {
+                                app.cursor = (app.cursor + viewport_height.saturating_sub(2)).min(line_count.saturating_sub(1));
+                            }
+                            KeyCode::Home => {
+                                app.cursor = 0;
+                            }
+                            KeyCode::End => {
+                                if line_count > 0 {
+                                    app.cursor = line_count - 1;
+                                }
+                            }
+                            KeyCode::Enter => {
+                                if let Some(line) = tree_lines.get(app.cursor) {
+                                    if line.expandable {
+                                        app.expansion.toggle(&line.path);
+                                    }
+                                }
+                            }
+                            KeyCode::Char('c') => {
+                                app.expansion.clear();
+                            }
+                            KeyCode::Char('e') => {
+                                app.expansion.expand_all(&all_expandable_paths);
+                            }
+                            _ => {}
                         }
                     }
-                    KeyCode::Char('c') => {
-                        // Collapse all
-                        app.expansion.clear();
+                    ViewMode::Diff { left, right, focus } => {
+                        match key.code {
+                            KeyCode::Char('q') | KeyCode::Esc => app.should_quit = true,
+                            KeyCode::Char('d') => app.exit_diff_mode(),
+                            KeyCode::Tab => app.toggle_diff_focus(),
+                            KeyCode::Left => {
+                                // Change the focused panel's state
+                                match focus {
+                                    DiffFocus::Left => {
+                                        if left > 0 {
+                                            app.view_mode = ViewMode::Diff { left: left - 1, right, focus };
+                                            app.scroll_offset = 0;
+                                        }
+                                    }
+                                    DiffFocus::Right => {
+                                        if right > 0 {
+                                            app.view_mode = ViewMode::Diff { left, right: right - 1, focus };
+                                            app.scroll_offset = 0;
+                                        }
+                                    }
+                                }
+                            }
+                            KeyCode::Right => {
+                                let max_state = app.trace.states.len().saturating_sub(1);
+                                match focus {
+                                    DiffFocus::Left => {
+                                        if left < max_state {
+                                            app.view_mode = ViewMode::Diff { left: left + 1, right, focus };
+                                            app.scroll_offset = 0;
+                                        }
+                                    }
+                                    DiffFocus::Right => {
+                                        if right < max_state {
+                                            app.view_mode = ViewMode::Diff { left, right: right + 1, focus };
+                                            app.scroll_offset = 0;
+                                        }
+                                    }
+                                }
+                            }
+                            KeyCode::Up => {
+                                if app.cursor > 0 {
+                                    app.cursor -= 1;
+                                }
+                            }
+                            KeyCode::Down => {
+                                if app.cursor + 1 < line_count {
+                                    app.cursor += 1;
+                                }
+                            }
+                            KeyCode::PageUp => {
+                                app.cursor = app.cursor.saturating_sub(viewport_height.saturating_sub(4));
+                            }
+                            KeyCode::PageDown => {
+                                app.cursor = (app.cursor + viewport_height.saturating_sub(4)).min(line_count.saturating_sub(1));
+                            }
+                            KeyCode::Home => {
+                                app.cursor = 0;
+                            }
+                            KeyCode::End => {
+                                if line_count > 0 {
+                                    app.cursor = line_count - 1;
+                                }
+                            }
+                            KeyCode::Enter => {
+                                // Toggle expand on current line (need to find the right line from focused panel)
+                                if let Some(line) = tree_lines.get(app.cursor) {
+                                    if line.expandable {
+                                        app.expansion.toggle(&line.path);
+                                    }
+                                }
+                            }
+                            KeyCode::Char('c') => {
+                                app.expansion.clear();
+                            }
+                            KeyCode::Char('e') => {
+                                app.expansion.expand_all(&all_expandable_paths);
+                            }
+                            _ => {}
+                        }
                     }
-                    KeyCode::Char('e') => {
-                        // Expand all expandable nodes
-                        let expandable_paths: Vec<_> = tree_lines
-                            .iter()
-                            .filter(|l| l.expandable)
-                            .map(|l| l.path.clone())
-                            .collect();
-                        app.expansion.expand_all(&expandable_paths);
-                    }
-                    _ => {}
                 }
             }
             Event::Mouse(mouse) => {
@@ -176,68 +337,142 @@ pub fn run(trace: Trace, auto_expand: bool) -> Result<()> {
 
                         if row == 0 {
                             // Header click - check which button
-                            if col >= header_layout.prev_start && col < header_layout.prev_end {
-                                // Previous state
-                                if app.current_state > 0 {
-                                    app.current_state -= 1;
-                                    app.cursor = 0;
-                                    app.scroll_offset = 0;
-                                    if app.auto_expand {
-                                        auto_expand_changes(&mut app);
+                            if col >= header_layout.diff_start && col < header_layout.diff_end {
+                                // Toggle diff mode
+                                match app.view_mode {
+                                    ViewMode::Single => app.enter_diff_mode(),
+                                    ViewMode::Diff { .. } => app.exit_diff_mode(),
+                                }
+                            } else if col >= header_layout.prev_start && col < header_layout.prev_end {
+                                // Previous state - behavior depends on mode
+                                match app.view_mode {
+                                    ViewMode::Single => {
+                                        if app.current_state > 0 {
+                                            app.current_state -= 1;
+                                            app.cursor = 0;
+                                            app.scroll_offset = 0;
+                                            if app.auto_expand {
+                                                auto_expand_changes(&mut app);
+                                            }
+                                        }
+                                    }
+                                    ViewMode::Diff { left, right, focus } => {
+                                        match focus {
+                                            DiffFocus::Left => {
+                                                if left > 0 {
+                                                    app.view_mode = ViewMode::Diff { left: left - 1, right, focus };
+                                                    app.scroll_offset = 0;
+                                                }
+                                            }
+                                            DiffFocus::Right => {
+                                                if right > 0 {
+                                                    app.view_mode = ViewMode::Diff { left, right: right - 1, focus };
+                                                    app.scroll_offset = 0;
+                                                }
+                                            }
+                                        }
                                     }
                                 }
                             } else if col >= header_layout.next_start && col < header_layout.next_end {
                                 // Next state
-                                if app.current_state + 1 < app.trace.states.len() {
-                                    app.current_state += 1;
-                                    app.cursor = 0;
-                                    app.scroll_offset = 0;
-                                    if app.auto_expand {
-                                        auto_expand_changes(&mut app);
+                                match app.view_mode {
+                                    ViewMode::Single => {
+                                        if app.current_state + 1 < app.trace.states.len() {
+                                            app.current_state += 1;
+                                            app.cursor = 0;
+                                            app.scroll_offset = 0;
+                                            if app.auto_expand {
+                                                auto_expand_changes(&mut app);
+                                            }
+                                        }
+                                    }
+                                    ViewMode::Diff { left, right, focus } => {
+                                        let max_state = app.trace.states.len().saturating_sub(1);
+                                        match focus {
+                                            DiffFocus::Left => {
+                                                if left < max_state {
+                                                    app.view_mode = ViewMode::Diff { left: left + 1, right, focus };
+                                                    app.scroll_offset = 0;
+                                                }
+                                            }
+                                            DiffFocus::Right => {
+                                                if right < max_state {
+                                                    app.view_mode = ViewMode::Diff { left, right: right + 1, focus };
+                                                    app.scroll_offset = 0;
+                                                }
+                                            }
+                                        }
                                     }
                                 }
                             } else if col >= header_layout.expand_start && col < header_layout.expand_end {
                                 // Expand all
-                                let expandable_paths: Vec<_> = tree_lines
-                                    .iter()
-                                    .filter(|l| l.expandable)
-                                    .map(|l| l.path.clone())
-                                    .collect();
-                                app.expansion.expand_all(&expandable_paths);
+                                app.expansion.expand_all(&all_expandable_paths);
                             } else if col >= header_layout.collapse_start && col < header_layout.collapse_end {
                                 // Collapse all
                                 app.expansion.clear();
                             }
                         } else if row >= 2 {
-                            // Tree content click
-                            let clicked_line = app.scroll_offset + (row - 2);
-                            if clicked_line < line_count {
-                                // Select the line
-                                app.cursor = clicked_line;
-                                // Toggle expand if expandable
-                                if let Some(line) = tree_lines.get(clicked_line) {
-                                    if line.expandable {
-                                        app.expansion.toggle(&line.path);
+                            match app.view_mode {
+                                ViewMode::Single => {
+                                    // Tree content click
+                                    let clicked_line = app.scroll_offset + (row - 2);
+                                    if clicked_line < line_count {
+                                        app.cursor = clicked_line;
+                                        if let Some(line) = tree_lines.get(clicked_line) {
+                                            if line.expandable {
+                                                app.expansion.toggle(&line.path);
+                                            }
+                                        }
+                                    }
+                                }
+                                ViewMode::Diff { left, right, .. } => {
+                                    // Click on panel to focus it and select/toggle line
+                                    let half_width = terminal_width / 2;
+                                    let new_focus = if col < half_width {
+                                        DiffFocus::Left
+                                    } else {
+                                        DiffFocus::Right
+                                    };
+                                    app.view_mode = ViewMode::Diff { left, right, focus: new_focus };
+
+                                    // Calculate clicked line (accounting for panel border)
+                                    // Row 0 = header, Row 1 = empty, Row 2 = panel border, Row 3+ = content
+                                    if row >= 3 {
+                                        let clicked_line = app.scroll_offset + (row - 3);
+                                        // Get the tree lines for the focused panel
+                                        let empty_diff = DiffResult { changes: std::collections::HashMap::new() };
+                                        let panel_width = half_width;
+                                        let state_idx = if new_focus == DiffFocus::Left { left } else { right };
+                                        let panel_lines = build_tree_lines_for_state(&app.trace, state_idx, &app.expansion, &empty_diff, panel_width);
+
+                                        if clicked_line < panel_lines.len() {
+                                            app.cursor = clicked_line;
+                                            if let Some(line) = panel_lines.get(clicked_line) {
+                                                if line.expandable {
+                                                    app.expansion.toggle(&line.path);
+                                                }
+                                            }
+                                        }
                                     }
                                 }
                             }
                         }
                     }
                     MouseEventKind::ScrollUp => {
-                        // Scroll up (move view up = show earlier content)
                         app.scroll_offset = app.scroll_offset.saturating_sub(3);
-                        // Keep cursor in view
-                        if app.cursor >= app.scroll_offset + viewport_height {
-                            app.cursor = (app.scroll_offset + viewport_height).saturating_sub(1);
+                        if app.view_mode == ViewMode::Single {
+                            if app.cursor >= app.scroll_offset + viewport_height {
+                                app.cursor = (app.scroll_offset + viewport_height).saturating_sub(1);
+                            }
                         }
                     }
                     MouseEventKind::ScrollDown => {
-                        // Scroll down (move view down = show later content)
                         let max_scroll = line_count.saturating_sub(viewport_height);
                         app.scroll_offset = (app.scroll_offset + 3).min(max_scroll);
-                        // Keep cursor in view
-                        if app.cursor < app.scroll_offset {
-                            app.cursor = app.scroll_offset;
+                        if app.view_mode == ViewMode::Single {
+                            if app.cursor < app.scroll_offset {
+                                app.cursor = app.scroll_offset;
+                            }
                         }
                     }
                     _ => {}
@@ -300,6 +535,8 @@ struct HeaderLayout {
     expand_end: usize,
     collapse_start: usize,
     collapse_end: usize,
+    diff_start: usize,
+    diff_end: usize,
 }
 
 fn render(frame: &mut Frame, app: &App, tree_lines: &[TreeLine], viewport_height: usize) -> HeaderLayout {
@@ -362,6 +599,14 @@ fn render(frame: &mut Frame, app: &App, tree_lines: &[TreeLine], viewport_height
     pos += collapse_btn.len();
     let collapse_end = pos;
 
+    let sep2 = " | ";
+    pos += sep2.len();
+
+    let diff_start = pos;
+    let diff_btn = "[diff]";
+    pos += diff_btn.len();
+    let diff_end = pos;
+
     let suffix = " | q quit ";
 
     let header = Line::from(vec![
@@ -373,6 +618,8 @@ fn render(frame: &mut Frame, app: &App, tree_lines: &[TreeLine], viewport_height
         Span::styled(expand_btn, button_style),
         Span::styled(space2, header_style),
         Span::styled(collapse_btn, button_style),
+        Span::styled(sep2, header_style),
+        Span::styled(diff_btn, button_style),
         Span::styled(suffix, header_style),
     ]);
 
@@ -432,5 +679,235 @@ fn render(frame: &mut Frame, app: &App, tree_lines: &[TreeLine], viewport_height
         expand_end,
         collapse_start,
         collapse_end,
+        diff_start,
+        diff_end,
+    }
+}
+
+/// Build tree lines for a specific state index
+fn build_tree_lines_for_state(
+    trace: &Trace,
+    state_idx: usize,
+    expansion: &ExpansionState,
+    diff: &DiffResult,
+    terminal_width: usize,
+) -> Vec<TreeLine> {
+    let mut tree_lines = Vec::new();
+    if let Some(state) = trace.states.get(state_idx) {
+        for (name, value) in &state.values {
+            let path = vec![name.clone()];
+            tree_lines.extend(render_value(name, value, path, expansion, diff, 0, terminal_width));
+        }
+    }
+    tree_lines
+}
+
+/// Compute diff between two specific states
+fn compute_diff_between(trace: &Trace, left_idx: usize, right_idx: usize) -> DiffResult {
+    use std::collections::HashMap;
+
+    if left_idx >= trace.states.len() || right_idx >= trace.states.len() {
+        return DiffResult { changes: HashMap::new() };
+    }
+
+    let left = &trace.states[left_idx].values;
+    let right = &trace.states[right_idx].values;
+    compute_diff(left, right)
+}
+
+/// Render side-by-side diff view
+fn render_diff(
+    frame: &mut Frame,
+    app: &App,
+    left_idx: usize,
+    right_idx: usize,
+    focus: DiffFocus,
+    viewport_height: usize,
+) -> HeaderLayout {
+    use ratatui::style::{Color, Modifier, Style};
+    use ratatui::text::{Line, Span};
+    use ratatui::layout::{Layout, Constraint, Direction};
+    use ratatui::widgets::{Block, Borders, Paragraph};
+
+    let header_style = Style::default()
+        .bg(Color::Indexed(56))
+        .fg(Color::White)
+        .add_modifier(Modifier::BOLD);
+
+    let button_style = Style::default()
+        .bg(Color::Indexed(56))
+        .fg(Color::Yellow)
+        .add_modifier(Modifier::BOLD);
+
+    // Build header for diff mode
+    let mut pos = 0;
+
+    let space1 = " ";
+    pos += space1.len();
+
+    let prev_start = pos;
+    let prev_btn = "[◀]";
+    pos += prev_btn.chars().count();
+    let prev_end = pos;
+
+    let state_text = format!(" State {} vs {} ", left_idx + 1, right_idx + 1);
+    pos += state_text.len();
+
+    let next_start = pos;
+    let next_btn = "[▶]";
+    pos += next_btn.chars().count();
+    let next_end = pos;
+
+    let sep1 = " | Tab:switch | ";
+    pos += sep1.len();
+
+    let expand_start = pos;
+    let expand_btn = "[+all]";
+    pos += expand_btn.len();
+    let expand_end = pos;
+
+    let space2 = " ";
+    pos += space2.len();
+
+    let collapse_start = pos;
+    let collapse_btn = "[-all]";
+    pos += collapse_btn.len();
+    let collapse_end = pos;
+
+    let sep2 = " | ";
+    pos += sep2.len();
+
+    let diff_start = pos;
+    let diff_btn = "[exit]";
+    pos += diff_btn.len();
+    let diff_end = pos;
+
+    let suffix = " | q quit ";
+
+    let header = Line::from(vec![
+        Span::styled(space1, header_style),
+        Span::styled(prev_btn, button_style),
+        Span::styled(&state_text, header_style),
+        Span::styled(next_btn, button_style),
+        Span::styled(sep1, header_style),
+        Span::styled(expand_btn, button_style),
+        Span::styled(space2, header_style),
+        Span::styled(collapse_btn, button_style),
+        Span::styled(sep2, header_style),
+        Span::styled(diff_btn, button_style),
+        Span::styled(suffix, header_style),
+    ]);
+
+    // Calculate panel width (half of terminal minus border)
+    let area = frame.area();
+    let panel_width = (area.width as usize) / 2;
+
+    // Compute diff: comparing left to right (what changed from left to right)
+    let diff_left_to_right = compute_diff_between(&app.trace, left_idx, right_idx);
+
+    // Empty diff for showing states without diff coloring
+    let empty_diff = DiffResult { changes: std::collections::HashMap::new() };
+
+    // Build tree lines for each side
+    let left_lines = build_tree_lines_for_state(&app.trace, left_idx, &app.expansion, &empty_diff, panel_width.saturating_sub(4));
+    let right_lines = build_tree_lines_for_state(&app.trace, right_idx, &app.expansion, &diff_left_to_right, panel_width.saturating_sub(4));
+
+    // Split layout: header + two panels side by side
+    let main_chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(1), Constraint::Length(1), Constraint::Min(0)])
+        .split(area);
+
+    let panel_chunks = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(main_chunks[2]);
+
+    // Render header
+    frame.render_widget(Paragraph::new(header), main_chunks[0]);
+
+    // Style for focused/unfocused borders
+    let focused_style = Style::default().fg(Color::Yellow);
+    let unfocused_style = Style::default().fg(Color::DarkGray);
+
+    let left_border_style = if focus == DiffFocus::Left { focused_style } else { unfocused_style };
+    let right_border_style = if focus == DiffFocus::Right { focused_style } else { unfocused_style };
+
+    // Build left panel content with cursor highlighting
+    let left_content: Vec<Line> = left_lines
+        .iter()
+        .enumerate()
+        .skip(app.scroll_offset)
+        .take(viewport_height)
+        .map(|(i, tree_line)| {
+            let is_cursor = focus == DiffFocus::Left && i == app.cursor;
+            let bg_color = if is_cursor { Some(Color::DarkGray) } else { None };
+            let styled_spans: Vec<Span> = tree_line.spans.iter().map(|span| {
+                let mut style = Style::default();
+                if let Some(bg) = bg_color {
+                    style = style.bg(bg);
+                }
+                Span::styled(&span.text, style)
+            }).collect();
+            Line::from(styled_spans)
+        })
+        .collect();
+
+    // Build right panel content with diff highlighting and cursor
+    let right_content: Vec<Line> = right_lines
+        .iter()
+        .enumerate()
+        .skip(app.scroll_offset)
+        .take(viewport_height)
+        .map(|(i, tree_line)| {
+            let is_cursor = focus == DiffFocus::Right && i == app.cursor;
+            let bg_color = if is_cursor { Some(Color::DarkGray) } else { None };
+            let diff_color = match tree_line.diff {
+                DiffKind::Added => Some(Color::Green),
+                DiffKind::Removed => Some(Color::Red),
+                DiffKind::Modified => Some(Color::Yellow),
+                DiffKind::Unchanged => None,
+            };
+            let styled_spans: Vec<Span> = tree_line.spans.iter().map(|span| {
+                let mut style = Style::default();
+                if let Some(fg) = diff_color {
+                    style = style.fg(fg);
+                }
+                if let Some(bg) = bg_color {
+                    style = style.bg(bg);
+                }
+                Span::styled(&span.text, style)
+            }).collect();
+            Line::from(styled_spans)
+        })
+        .collect();
+
+    let left_block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(left_border_style)
+        .title(format!(" State {} ", left_idx + 1));
+
+    let right_block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(right_border_style)
+        .title(format!(" State {} ", right_idx + 1));
+
+    let left_para = Paragraph::new(left_content).block(left_block);
+    let right_para = Paragraph::new(right_content).block(right_block);
+
+    frame.render_widget(left_para, panel_chunks[0]);
+    frame.render_widget(right_para, panel_chunks[1]);
+
+    HeaderLayout {
+        prev_start,
+        prev_end,
+        next_start,
+        next_end,
+        expand_start,
+        expand_end,
+        collapse_start,
+        collapse_end,
+        diff_start,
+        diff_end,
     }
 }
