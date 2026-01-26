@@ -314,28 +314,43 @@ pub fn render_value(
         itf::Value::Record(fields) => {
             // Check for sum type pattern: {tag: String, value: X}
             if let Some((tag, inner_value)) = detect_sum_type(fields) {
-                // Display as Tag(preview of value)
-                let inner_preview = format_value_full(inner_value, thresholds.preview)
-                    .unwrap_or_else(|| format_value_short(inner_value));
+                // Check if inner value is unit (empty tuple or empty record)
+                let is_unit = matches!(
+                    inner_value,
+                    itf::Value::Tuple(items) if items.is_empty()
+                ) || matches!(
+                    inner_value,
+                    itf::Value::Record(fields) if fields.is_empty()
+                );
 
-                // Check if inner value can be fully inlined
-                let can_inline = format_value_full(inner_value, thresholds.preview).is_some();
-
-                if can_inline {
-                    let text = format!("{}{}{}({})", indent, prefix, tag, inner_preview);
+                if is_unit {
+                    // Just show the tag without parentheses
+                    let text = format!("{}{}{}", indent, prefix, tag);
                     vec![TreeLine::with_default_spans(path, text, false, diff_kind)]
                 } else {
-                    let icon = if expanded { "▼" } else { "▶" };
-                    let icon_prefix = name_prefix_with_icon(icon, name, diff_kind);
-                    let text = format!("{}{}{}({})", indent, icon_prefix, tag, inner_preview);
-                    let mut lines = vec![TreeLine::with_default_spans(path.clone(), text, true, diff_kind)];
-                    if expanded {
-                        // Only show the inner value's contents, skip tag
-                        let mut value_path = path.clone();
-                        value_path.push("value".to_string());
-                        lines.extend(render_value_children(inner_value, value_path, expansion, diff, depth + 1, terminal_width, collapse_threshold));
+                    // Display as Tag(preview of value)
+                    let inner_preview = format_value_full(inner_value, thresholds.preview)
+                        .unwrap_or_else(|| format_value_short(inner_value));
+
+                    // Check if inner value can be fully inlined
+                    let can_inline = format_value_full(inner_value, thresholds.preview).is_some();
+
+                    if can_inline {
+                        let text = format!("{}{}{}({})", indent, prefix, tag, inner_preview);
+                        vec![TreeLine::with_default_spans(path, text, false, diff_kind)]
+                    } else {
+                        let icon = if expanded { "▼" } else { "▶" };
+                        let icon_prefix = name_prefix_with_icon(icon, name, diff_kind);
+                        let text = format!("{}{}{}({})", indent, icon_prefix, tag, inner_preview);
+                        let mut lines = vec![TreeLine::with_default_spans(path.clone(), text, true, diff_kind)];
+                        if expanded {
+                            // Only show the inner value's contents, skip tag
+                            let mut value_path = path.clone();
+                            value_path.push("value".to_string());
+                            lines.extend(render_value_children(inner_value, value_path, expansion, diff, depth + 1, terminal_width, collapse_threshold));
+                        }
+                        lines
                     }
-                    lines
                 }
             } else if let Some(inline) = format_value_full(value, thresholds.inline) {
                 // Small record, show inline without expand
@@ -408,14 +423,20 @@ pub fn render_value(
 
                                     let val_full = format_value_full(val, thresholds.value);
                                     let can_inline = val_full.is_some();
-                                    let val_display = val_full.unwrap_or_else(|| format_value_short(val));
 
                                     let marker = diff_marker(child_diff);
                                     let entry_text = if can_inline {
-                                        format!("{}  {}{} -> {}", indent, marker, key_str, val_display)
+                                        format!("{}  {}{} -> {}", indent, marker, key_str, val_full.unwrap())
                                     } else {
                                         let entry_icon = if expansion.is_expanded(&child_path) { "▼" } else { "▶" };
-                                        format!("{}  {}{} {} -> {}", indent, marker, entry_icon, key_str, val_display)
+                                        if expansion.is_expanded(&child_path) {
+                                            // Expanded: don't show preview, children will render delimiters
+                                            format!("{}  {}{} {} ->", indent, marker, entry_icon, key_str)
+                                        } else {
+                                            // Collapsed: show preview
+                                            let val_preview = format_value_short(val);
+                                            format!("{}  {}{} {} -> {}", indent, marker, entry_icon, key_str, val_preview)
+                                        }
                                     };
 
                                     lines.push(TreeLine::with_default_spans(child_path.clone(), entry_text, !can_inline, child_diff));
@@ -445,16 +466,22 @@ pub fn render_value(
                                 // Try to format value fully inline
                                 let val_full = format_value_full(val, thresholds.value);
                                 let can_inline = val_full.is_some();
-                                let val_display = val_full.unwrap_or_else(|| format_value_short(val));
 
                                 let marker = diff_marker(child_diff);
                                 let entry_text = if can_inline {
                                     // Simple value, no icon needed
-                                    format!("{}  {}{} -> {}", indent, marker, key_str, val_display)
+                                    format!("{}  {}{} -> {}", indent, marker, key_str, val_full.unwrap())
                                 } else {
                                     // Complex value, show expand icon
                                     let entry_icon = if expansion.is_expanded(&child_path) { "▼" } else { "▶" };
-                                    format!("{}  {}{} {} -> {}", indent, marker, entry_icon, key_str, val_display)
+                                    if expansion.is_expanded(&child_path) {
+                                        // Expanded: don't show preview, children will render delimiters
+                                        format!("{}  {}{} {} ->", indent, marker, entry_icon, key_str)
+                                    } else {
+                                        // Collapsed: show preview
+                                        let val_preview = format_value_short(val);
+                                        format!("{}  {}{} {} -> {}", indent, marker, entry_icon, key_str, val_preview)
+                                    }
                                 };
 
                                 lines.push(TreeLine::with_default_spans(child_path.clone(), entry_text, !can_inline, child_diff));
@@ -719,21 +746,36 @@ fn render_value_children(
     match value {
         itf::Value::Record(fields) => {
             let mut lines = Vec::new();
+            let indent = "  ".repeat(depth);
+
+            // Add opening delimiter
+            let open_text = format!("{}{{", indent);
+            lines.push(TreeLine::with_default_spans(path.clone(), open_text, false, DiffKind::Unchanged));
+
             for (field_name, field_value) in fields.iter() {
                 let mut field_path = path.clone();
                 field_path.push(field_name.clone());
-                lines.extend(render_value(field_name, field_value, field_path, expansion, diff, depth, terminal_width, collapse_threshold));
+                lines.extend(render_value(field_name, field_value, field_path, expansion, diff, depth + 1, terminal_width, collapse_threshold));
             }
+
+            // Add closing delimiter
+            let close_text = format!("{}}}", indent);
+            lines.push(TreeLine::with_default_spans(path.clone(), close_text, false, DiffKind::Unchanged));
+
             lines
         }
         itf::Value::Set(items) => {
             let mut lines = Vec::new();
             let count = items.iter().count();
+            let indent = "  ".repeat(depth);
+
+            // Add opening delimiter
+            let open_text = format!("{}Set(", indent);
+            lines.push(TreeLine::with_default_spans(path.clone(), open_text, false, DiffKind::Unchanged));
 
             // Group items by change status and apply collapsing
             let groups = group_by_change_status(count, diff, &path);
             let items_vec: Vec<_> = items.iter().collect();
-            let indent = "  ".repeat(depth);
 
             // Check if any items are changed - only use collapsing syntax if there's a mix
             let has_any_changed = groups.iter().any(|(_, _, is_changed)| *is_changed);
@@ -752,12 +794,12 @@ fn render_value_children(
                             let item = items_vec[i];
                             let mut item_path = path.clone();
                             item_path.push(format!("{}", i));
-                            lines.extend(render_value("", item, item_path, expansion, diff, depth, terminal_width, collapse_threshold));
+                            lines.extend(render_value("", item, item_path, expansion, diff, depth + 1, terminal_width, collapse_threshold));
                         }
                     } else {
                         // Show collapsed summary (expandable)
                         let icon = "▶";
-                        let summary_text = format!("{}{}... ({} unchanged)", indent, icon, group_count);
+                        let summary_text = format!("{}  {} ... ({} unchanged)", indent, icon, group_count);
                         lines.push(TreeLine::with_default_spans(group_path, summary_text, true, DiffKind::Unchanged));
                     }
                 } else {
@@ -766,15 +808,24 @@ fn render_value_children(
                         let item = items_vec[i];
                         let mut item_path = path.clone();
                         item_path.push(format!("{}", i));
-                        lines.extend(render_value("", item, item_path, expansion, diff, depth, terminal_width, collapse_threshold));
+                        lines.extend(render_value("", item, item_path, expansion, diff, depth + 1, terminal_width, collapse_threshold));
                     }
                 }
             }
+
+            // Add closing delimiter
+            let close_text = format!("{})", indent);
+            lines.push(TreeLine::with_default_spans(path.clone(), close_text, false, DiffKind::Unchanged));
+
             lines
         }
         itf::Value::List(items) => {
             let mut lines = Vec::new();
             let indent = "  ".repeat(depth);
+
+            // Add opening delimiter
+            let open_text = format!("{}[", indent);
+            lines.push(TreeLine::with_default_spans(path.clone(), open_text, false, DiffKind::Unchanged));
 
             // Group items by change status and apply collapsing
             let groups = group_by_change_status(items.len(), diff, &path);
@@ -796,12 +847,12 @@ fn render_value_children(
                             let item = &items[i];
                             let mut item_path = path.clone();
                             item_path.push(format!("{}", i));
-                            lines.extend(render_value(&format!("[{}]", i), item, item_path, expansion, diff, depth, terminal_width, collapse_threshold));
+                            lines.extend(render_value(&format!("[{}]", i), item, item_path, expansion, diff, depth + 1, terminal_width, collapse_threshold));
                         }
                     } else {
                         // Show collapsed summary (expandable)
                         let icon = "▶";
-                        let summary_text = format!("{}{}... ([{}..{}] {} unchanged)", indent, icon, start, start + group_count - 1, group_count);
+                        let summary_text = format!("{}  {} ... ([{}..{}] {} unchanged)", indent, icon, start, start + group_count - 1, group_count);
                         lines.push(TreeLine::with_default_spans(group_path, summary_text, true, DiffKind::Unchanged));
                     }
                 } else {
@@ -810,15 +861,25 @@ fn render_value_children(
                         let item = &items[i];
                         let mut item_path = path.clone();
                         item_path.push(format!("{}", i));
-                        lines.extend(render_value(&format!("[{}]", i), item, item_path, expansion, diff, depth, terminal_width, collapse_threshold));
+                        lines.extend(render_value(&format!("[{}]", i), item, item_path, expansion, diff, depth + 1, terminal_width, collapse_threshold));
                     }
                 }
             }
+
+            // Add closing delimiter
+            let close_text = format!("{}]", indent);
+            lines.push(TreeLine::with_default_spans(path.clone(), close_text, false, DiffKind::Unchanged));
+
             lines
         }
         itf::Value::Map(pairs) => {
             let mut lines = Vec::new();
             let indent = "  ".repeat(depth);
+
+            // Add opening delimiter
+            let open_text = format!("{}Map(", indent);
+            lines.push(TreeLine::with_default_spans(path.clone(), open_text, false, DiffKind::Unchanged));
+
             for (i, (k, v)) in pairs.iter().enumerate() {
                 // Try to show full key, fall back to short
                 let k_str = format_value_full(k, thresholds.key)
@@ -831,18 +892,27 @@ fn render_value_children(
                 let entry_diff = diff.get(&entry_path);
                 let marker = diff_marker(entry_diff);
 
-                let text = format!("{}{}{} -> {}", indent, marker, k_str, v_display);
+                let text = format!("{}  {}{} -> {}", indent, marker, k_str, v_display);
                 lines.push(TreeLine::with_default_spans(entry_path.clone(), text, !can_inline, entry_diff));
 
                 if !can_inline && expansion.is_expanded(&entry_path) {
                     lines.extend(render_value_children(v, entry_path, expansion, diff, depth + 1, terminal_width, collapse_threshold));
                 }
             }
+
+            // Add closing delimiter
+            let close_text = format!("{})", indent);
+            lines.push(TreeLine::with_default_spans(path.clone(), close_text, false, DiffKind::Unchanged));
+
             lines
         }
         itf::Value::Tuple(items) => {
             let mut lines = Vec::new();
             let indent = "  ".repeat(depth);
+
+            // Add opening delimiter
+            let open_text = format!("{}(", indent);
+            lines.push(TreeLine::with_default_spans(path.clone(), open_text, false, DiffKind::Unchanged));
 
             // Group items by change status and apply collapsing
             let groups = group_by_change_status(items.len(), diff, &path);
@@ -865,12 +935,12 @@ fn render_value_children(
                             let item = items_vec[i];
                             let mut item_path = path.clone();
                             item_path.push(format!("{}", i));
-                            lines.extend(render_value(&format!("[{}]", i), item, item_path, expansion, diff, depth, terminal_width, collapse_threshold));
+                            lines.extend(render_value(&format!("[{}]", i), item, item_path, expansion, diff, depth + 1, terminal_width, collapse_threshold));
                         }
                     } else {
                         // Show collapsed summary (expandable)
                         let icon = "▶";
-                        let summary_text = format!("{}{}... ([{}..{}] {} unchanged)", indent, icon, start, start + group_count - 1, group_count);
+                        let summary_text = format!("{}  {} ... ([{}..{}] {} unchanged)", indent, icon, start, start + group_count - 1, group_count);
                         lines.push(TreeLine::with_default_spans(group_path, summary_text, true, DiffKind::Unchanged));
                     }
                 } else {
@@ -879,10 +949,15 @@ fn render_value_children(
                         let item = items_vec[i];
                         let mut item_path = path.clone();
                         item_path.push(format!("{}", i));
-                        lines.extend(render_value(&format!("[{}]", i), item, item_path, expansion, diff, depth, terminal_width, collapse_threshold));
+                        lines.extend(render_value(&format!("[{}]", i), item, item_path, expansion, diff, depth + 1, terminal_width, collapse_threshold));
                     }
                 }
             }
+
+            // Add closing delimiter
+            let close_text = format!("{})", indent);
+            lines.push(TreeLine::with_default_spans(path.clone(), close_text, false, DiffKind::Unchanged));
+
             lines
         }
         // Simple values have no children
@@ -916,7 +991,27 @@ fn format_value_short(value: &itf::Value) -> String {
         itf::Value::Number(n) => n.to_string(),
         itf::Value::String(s) => format!("\"{}\"", s),
         itf::Value::BigInt(n) => n.to_string(),
-        itf::Value::Record(_) => "{ ... }".to_string(),
+        itf::Value::Record(fields) => {
+            // Check for sum type pattern
+            if let Some((tag, inner_value)) = detect_sum_type(fields) {
+                // Check if inner value is unit
+                let is_unit = matches!(
+                    inner_value,
+                    itf::Value::Tuple(items) if items.is_empty()
+                ) || matches!(
+                    inner_value,
+                    itf::Value::Record(fields) if fields.is_empty()
+                );
+
+                if is_unit {
+                    tag.to_string()
+                } else {
+                    format!("{}(...)", tag)
+                }
+            } else {
+                "{ ... }".to_string()
+            }
+        }
         itf::Value::Map(_) => "Map(...)".to_string(),
         itf::Value::Set(_) => "Set(...)".to_string(),
         itf::Value::List(_) => "[...]".to_string(),
@@ -950,7 +1045,28 @@ fn format_value_full(value: &itf::Value, max_len: usize) -> Option<String> {
         itf::Value::String(s) => format!("\"{}\"", s),
         itf::Value::BigInt(n) => n.to_string(),
         itf::Value::Record(fields) => {
-            if fields.is_empty() {
+            // Check for sum type pattern
+            if let Some((tag, inner_value)) = detect_sum_type(fields) {
+                // Check if inner value is unit
+                let is_unit = matches!(
+                    inner_value,
+                    itf::Value::Tuple(items) if items.is_empty()
+                ) || matches!(
+                    inner_value,
+                    itf::Value::Record(fields) if fields.is_empty()
+                );
+
+                if is_unit {
+                    tag.to_string()
+                } else {
+                    // Format as Tag(value)
+                    if let Some(inner_str) = format_value_full(inner_value, max_len) {
+                        format!("{}({})", tag, inner_str)
+                    } else {
+                        return None; // Inner value too complex
+                    }
+                }
+            } else if fields.is_empty() {
                 "{ }".to_string()
             } else {
                 let parts: Vec<String> = fields
