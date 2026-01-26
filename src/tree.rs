@@ -42,12 +42,14 @@ pub type NodePath = Vec<String>;
 /// Tracks which nodes are expanded
 pub struct ExpansionState {
     expanded: HashSet<NodePath>,
+    manual_overrides: HashSet<NodePath>, // Paths explicitly toggled by user
 }
 
 impl ExpansionState {
     pub fn new() -> Self {
         Self {
             expanded: HashSet::new(),
+            manual_overrides: HashSet::new(),
         }
     }
 
@@ -55,10 +57,25 @@ impl ExpansionState {
         self.expanded.contains(path)
     }
 
+    /// Toggle expansion manually (user action)
     pub fn toggle(&mut self, path: &NodePath) {
         if self.expanded.contains(path) {
             self.expanded.remove(path);
         } else {
+            self.expanded.insert(path.clone());
+        }
+        // Mark as manual override
+        self.manual_overrides.insert(path.clone());
+    }
+
+    /// Check if a path was manually overridden by user
+    pub fn is_manual(&self, path: &NodePath) -> bool {
+        self.manual_overrides.contains(path)
+    }
+
+    /// Automatically expand a path (not a user action)
+    fn auto_expand(&mut self, path: &NodePath) {
+        if !self.manual_overrides.contains(path) {
             self.expanded.insert(path.clone());
         }
     }
@@ -70,23 +87,90 @@ impl ExpansionState {
             // Expand all ancestor paths (not the leaf itself unless it has children)
             for i in 1..path.len() {
                 let ancestor = path[0..i].to_vec();
-                self.expanded.insert(ancestor);
+                self.auto_expand(&ancestor);
             }
             // Also expand the path itself (in case it has nested changes)
-            self.expanded.insert(path.clone());
+            self.auto_expand(path);
         }
     }
 
-    /// Clear all expansions
+    /// Clear all expansions and manual overrides
     pub fn clear(&mut self) {
         self.expanded.clear();
+        self.manual_overrides.clear();
     }
 
-    /// Expand all given paths
+    /// Expand all given paths (used for expand-all command)
     pub fn expand_all(&mut self, paths: &[NodePath]) {
         for path in paths {
             self.expanded.insert(path.clone());
+            self.manual_overrides.insert(path.clone());
         }
+    }
+
+    /// Save current expansion state (for backtracking)
+    pub fn snapshot(&self) -> HashSet<NodePath> {
+        self.expanded.clone()
+    }
+
+    /// Restore expansion state from snapshot
+    pub fn restore(&mut self, snapshot: &HashSet<NodePath>) {
+        // Only restore non-manual items
+        let mut new_expanded = HashSet::new();
+
+        // Keep manual overrides
+        for path in &self.expanded {
+            if self.manual_overrides.contains(path) {
+                new_expanded.insert(path.clone());
+            }
+        }
+
+        // Restore non-manual items from snapshot
+        for path in snapshot {
+            if !self.manual_overrides.contains(path) {
+                new_expanded.insert(path.clone());
+            }
+        }
+
+        self.expanded = new_expanded;
+    }
+
+    /// Expand all items at a given depth, prioritizing changed items
+    /// Returns true if any changes were made
+    pub fn expand_level(
+        &mut self,
+        all_expandable_paths: &[NodePath],
+        changed_paths: &[NodePath],
+        target_depth: usize,
+    ) -> bool {
+        let changed_set: HashSet<_> = changed_paths.iter().collect();
+        let mut changed = false;
+
+        // First, expand changed items at this depth
+        for path in all_expandable_paths {
+            if path.len() == target_depth
+                && changed_set.contains(path)
+                && !self.is_expanded(path)
+                && !self.is_manual(path)
+            {
+                self.auto_expand(path);
+                changed = true;
+            }
+        }
+
+        // Then, expand unchanged items at this depth
+        for path in all_expandable_paths {
+            if path.len() == target_depth
+                && !changed_set.contains(path)
+                && !self.is_expanded(path)
+                && !self.is_manual(path)
+            {
+                self.auto_expand(path);
+                changed = true;
+            }
+        }
+
+        changed
     }
 }
 

@@ -94,6 +94,68 @@ impl App {
     }
 }
 
+/// Auto-adjust expansion to fill available vertical space
+/// Uses level-by-level expansion with backtracking
+fn auto_adjust_expansion(app: &mut App, terminal_width: usize, viewport_height: usize) {
+    let diff = compute_diff_for_state(&app);
+    let changed_paths: Vec<_> = diff.changes.keys().cloned().collect();
+
+    // Save the initial state (everything collapsed by auto-expansion)
+    let mut last_good_snapshot = app.expansion.snapshot();
+
+    // Iterate through depth levels
+    const MAX_DEPTH: usize = 20; // Reasonable maximum depth
+    for depth in 1..=MAX_DEPTH {
+        // Get current state
+        let lines = build_tree_lines(&app, &diff, terminal_width);
+        let current_count = lines.len();
+
+        // Check if we've filled enough of the viewport (leave small buffer)
+        if current_count >= viewport_height.saturating_sub(3) {
+            // We've filled the viewport, stop here
+            break;
+        }
+
+        // Get all expandable paths
+        let all_expandable: Vec<_> = lines.iter()
+            .filter(|l| l.expandable)
+            .map(|l| l.path.clone())
+            .collect();
+
+        // Check if there are any items at this depth to expand
+        let has_items_at_depth = all_expandable.iter().any(|p| p.len() == depth);
+        if !has_items_at_depth {
+            // No more items at this depth, continue to next depth
+            continue;
+        }
+
+        // Try expanding all items at this depth (changed items first)
+        let changed = app.expansion.expand_level(
+            &all_expandable,
+            &changed_paths,
+            depth,
+        );
+
+        if !changed {
+            // Nothing was expanded at this level, move to next depth
+            continue;
+        }
+
+        // Re-render to check if we overflowed
+        let lines = build_tree_lines(&app, &diff, terminal_width);
+        let new_count = lines.len();
+
+        if new_count > viewport_height {
+            // We overflowed! Backtrack to previous good state
+            app.expansion.restore(&last_good_snapshot);
+            break;
+        } else {
+            // This level fits! Save it as the last good state (after expansion)
+            last_good_snapshot = app.expansion.snapshot();
+        }
+    }
+}
+
 /// Run the TUI application
 pub fn run(trace: Trace, auto_expand: bool) -> Result<()> {
     // Setup terminal
@@ -118,6 +180,11 @@ pub fn run(trace: Trace, auto_expand: bool) -> Result<()> {
             ViewMode::Single => terminal_height.saturating_sub(2),
             ViewMode::Diff { .. } => terminal_height.saturating_sub(4),
         };
+
+        // Auto-adjust expansion to fill available space (only in single mode)
+        if matches!(app.view_mode, ViewMode::Single) {
+            auto_adjust_expansion(&mut app, terminal_width, viewport_height);
+        }
 
         // Build tree lines based on view mode
         // tree_lines: used for cursor navigation and Enter toggle
