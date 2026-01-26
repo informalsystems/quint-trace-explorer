@@ -388,20 +388,35 @@ pub fn render_value(
             }
         }
 
-        // Tuple - expandable
+        // Tuple - expandable only if content can't be shown inline
         itf::Value::Tuple(items) => {
-            let icon = if expanded { "▼" } else { "▶" };
-            let icon_prefix = name_prefix_with_icon(icon, name, diff_kind);
-            let text = format!("{}{}Tuple({} items)", indent, icon_prefix, items.len());
-            let mut lines = vec![TreeLine::with_default_spans(path.clone(), text, true, diff_kind)];
-            if expanded {
-                for (i, item) in items.iter().enumerate() {
-                    let mut child_path = path.clone();
-                    child_path.push(format!("{}", i));
-                    lines.extend(render_value(&format!("[{}]", i), item, child_path, expansion, diff, depth + 1, terminal_width));
+            let all_simple = all_simple(items.iter());
+            let inline = if all_simple {
+                format_collection_inline(items.iter(), "(", ")", thresholds.inline)
+            } else {
+                None
+            };
+
+            // If we can show inline, no need for expand/collapse
+            if let Some(ref inline_str) = inline {
+                let text = format!("{}{}{}", indent, prefix, inline_str);
+                vec![TreeLine::with_default_spans(path, text, false, diff_kind)]
+            } else {
+                // Complex or too long - needs expand/collapse
+                let icon = if expanded { "▼" } else { "▶" };
+                let icon_prefix = name_prefix_with_icon(icon, name, diff_kind);
+                let text = format!("{}{}Tuple({} items)", indent, icon_prefix, items.len());
+                let mut lines = vec![TreeLine::with_default_spans(path.clone(), text, true, diff_kind)];
+
+                if expanded {
+                    for (i, item) in items.iter().enumerate() {
+                        let mut child_path = path.clone();
+                        child_path.push(format!("{}", i));
+                        lines.extend(render_value(&format!("[{}]", i), item, child_path, expansion, diff, depth + 1, terminal_width));
+                    }
                 }
+                lines
             }
-            lines
         }
 
         itf::Value::Unserializable(u) => {
@@ -545,7 +560,13 @@ fn format_value_short(value: &itf::Value) -> String {
         itf::Value::Map(_) => "Map(...)".to_string(),
         itf::Value::Set(_) => "{ ... }".to_string(),
         itf::Value::List(_) => "[...]".to_string(),
-        itf::Value::Tuple(_) => "(...)".to_string(),
+        itf::Value::Tuple(items) => {
+            if items.is_empty() {
+                "()".to_string()
+            } else {
+                "(...)".to_string()
+            }
+        }
         itf::Value::Unserializable(_) => "<?>".to_string(),
     }
 }
