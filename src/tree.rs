@@ -257,11 +257,14 @@ pub fn render_value(
                 let text = format!("{}{}{}", indent, prefix, inline);
                 vec![TreeLine::with_default_spans(path, text, false, diff_kind)]
             } else {
-                // Large record, show preview and allow expand
+                // Large record
                 let icon = if expanded { "▼" } else { "▶" };
                 let icon_prefix = name_prefix_with_icon(icon, name, diff_kind);
-                let preview = format_record_preview(fields, thresholds.preview);
-                let text = format!("{}{}{}", indent, icon_prefix, preview);
+                let text = if expanded {
+                    format!("{}{}{{", indent, icon_prefix)
+                } else {
+                    format!("{}{}{{{} fields}}", indent, icon_prefix, fields.len())
+                };
                 let mut lines = vec![TreeLine::with_default_spans(path.clone(), text, true, diff_kind)];
                 if expanded {
                     for (field_name, field_value) in fields.iter() {
@@ -269,6 +272,9 @@ pub fn render_value(
                         child_path.push(field_name.clone());
                         lines.extend(render_value(field_name, field_value, child_path, expansion, diff, depth + 1, terminal_width));
                     }
+                    // Add closing brace
+                    let close_text = format!("{}}}", indent);
+                    lines.push(TreeLine::with_default_spans(path.clone(), close_text, false, diff_kind));
                 }
                 lines
             }
@@ -278,12 +284,16 @@ pub fn render_value(
         itf::Value::Map(pairs) => {
             if pairs.is_empty() {
                 // Empty map, no expand needed
-                let text = format!("{}{}Map(empty)", indent, prefix);
+                let text = format!("{}{}Map()", indent, prefix);
                 vec![TreeLine::with_default_spans(path, text, false, diff_kind)]
             } else {
                 let icon = if expanded { "▼" } else { "▶" };
                 let icon_prefix = name_prefix_with_icon(icon, name, diff_kind);
-                let text = format!("{}{}Map({} entries)", indent, icon_prefix, pairs.len());
+                let text = if expanded {
+                    format!("{}{}Map(", indent, icon_prefix)
+                } else {
+                    format!("{}{}Map({} entries)", indent, icon_prefix, pairs.len())
+                };
                 let mut lines = vec![TreeLine::with_default_spans(path.clone(), text, true, diff_kind)];
                 if expanded {
                     for (i, (key, val)) in pairs.iter().enumerate() {
@@ -318,6 +328,9 @@ pub fn render_value(
                             lines.extend(child_lines);
                         }
                     }
+                    // Add closing paren
+                    let close_text = format!("{})", indent);
+                    lines.push(TreeLine::with_default_spans(path.clone(), close_text, false, diff_kind));
                 }
                 lines
             }
@@ -341,7 +354,11 @@ pub fn render_value(
                 // Complex or too long - needs expand/collapse
                 let icon = if expanded { "▼" } else { "▶" };
                 let icon_prefix = name_prefix_with_icon(icon, name, diff_kind);
-                let text = format!("{}{}Set({} items)", indent, icon_prefix, count);
+                let text = if expanded {
+                    format!("{}{}Set(", indent, icon_prefix)
+                } else {
+                    format!("{}{}Set({} items)", indent, icon_prefix, count)
+                };
                 let mut lines = vec![TreeLine::with_default_spans(path.clone(), text, true, diff_kind)];
 
                 if expanded {
@@ -351,6 +368,9 @@ pub fn render_value(
                         child_path.push(format!("{}", i));
                         lines.extend(render_value("", item, child_path, expansion, diff, depth + 1, terminal_width));
                     }
+                    // Add closing paren
+                    let close_text = format!("{})", indent);
+                    lines.push(TreeLine::with_default_spans(path.clone(), close_text, false, diff_kind));
                 }
                 lines
             }
@@ -373,7 +393,11 @@ pub fn render_value(
                 // Complex or too long - needs expand/collapse
                 let icon = if expanded { "▼" } else { "▶" };
                 let icon_prefix = name_prefix_with_icon(icon, name, diff_kind);
-                let text = format!("{}{}List({} items)", indent, icon_prefix, items.len());
+                let text = if expanded {
+                    format!("{}{}[", indent, icon_prefix)
+                } else {
+                    format!("{}{}List({} items)", indent, icon_prefix, items.len())
+                };
                 let mut lines = vec![TreeLine::with_default_spans(path.clone(), text, true, diff_kind)];
 
                 if expanded {
@@ -383,6 +407,9 @@ pub fn render_value(
                         child_path.push(format!("{}", i));
                         lines.extend(render_value(&format!("[{}]", i), item, child_path, expansion, diff, depth + 1, terminal_width));
                     }
+                    // Add closing bracket
+                    let close_text = format!("{}]", indent);
+                    lines.push(TreeLine::with_default_spans(path.clone(), close_text, false, diff_kind));
                 }
                 lines
             }
@@ -405,7 +432,11 @@ pub fn render_value(
                 // Complex or too long - needs expand/collapse
                 let icon = if expanded { "▼" } else { "▶" };
                 let icon_prefix = name_prefix_with_icon(icon, name, diff_kind);
-                let text = format!("{}{}Tuple({} items)", indent, icon_prefix, items.len());
+                let text = if expanded {
+                    format!("{}{}(", indent, icon_prefix)
+                } else {
+                    format!("{}{}Tuple({} items)", indent, icon_prefix, items.len())
+                };
                 let mut lines = vec![TreeLine::with_default_spans(path.clone(), text, true, diff_kind)];
 
                 if expanded {
@@ -414,6 +445,9 @@ pub fn render_value(
                         child_path.push(format!("{}", i));
                         lines.extend(render_value(&format!("[{}]", i), item, child_path, expansion, diff, depth + 1, terminal_width));
                     }
+                    // Add closing paren
+                    let close_text = format!("{})", indent);
+                    lines.push(TreeLine::with_default_spans(path.clone(), close_text, false, diff_kind));
                 }
                 lines
             }
@@ -521,32 +555,6 @@ fn detect_sum_type(fields: &itf::value::Record) -> Option<(&str, &itf::Value)> {
     } else {
         None
     }
-}
-
-/// Format a preview of a record showing first few fields
-fn format_record_preview(fields: &itf::value::Record, max_len: usize) -> String {
-    if fields.is_empty() {
-        return "{ }".to_string();
-    }
-
-    let mut parts = Vec::new();
-    let mut total_len = 4; // for "{ " and " }"
-
-    for (key, val) in fields.iter() {
-        let val_short = format_value_short(val);
-        let part = format!("{}: {}", key, val_short);
-
-        if total_len + part.len() + 2 > max_len && !parts.is_empty() {
-            // Would exceed max, stop and add ellipsis
-            parts.push("...".to_string());
-            break;
-        }
-
-        total_len += part.len() + 2; // +2 for ", "
-        parts.push(part);
-    }
-
-    format!("{{ {} }}", parts.join(", "))
 }
 
 /// Short format for map keys
