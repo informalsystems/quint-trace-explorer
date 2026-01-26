@@ -283,6 +283,7 @@ pub fn render_value(
     diff: &DiffResult,
     depth: usize,
     terminal_width: usize,
+    collapse_threshold: usize,
 ) -> Vec<TreeLine> {
     let indent = "  ".repeat(depth);
     let expanded = expansion.is_expanded(&path);
@@ -332,7 +333,7 @@ pub fn render_value(
                         // Only show the inner value's contents, skip tag
                         let mut value_path = path.clone();
                         value_path.push("value".to_string());
-                        lines.extend(render_value_children(inner_value, value_path, expansion, diff, depth + 1, terminal_width));
+                        lines.extend(render_value_children(inner_value, value_path, expansion, diff, depth + 1, terminal_width, collapse_threshold));
                     }
                     lines
                 }
@@ -354,7 +355,7 @@ pub fn render_value(
                     for (field_name, field_value) in fields.iter() {
                         let mut child_path = path.clone();
                         child_path.push(field_name.clone());
-                        lines.extend(render_value(field_name, field_value, child_path, expansion, diff, depth + 1, terminal_width));
+                        lines.extend(render_value(field_name, field_value, child_path, expansion, diff, depth + 1, terminal_width, collapse_threshold));
                     }
                     // Add closing brace
                     let close_text = format!("{}}}", indent);
@@ -380,38 +381,94 @@ pub fn render_value(
                 };
                 let mut lines = vec![TreeLine::with_default_spans(path.clone(), text, true, diff_kind)];
                 if expanded {
-                    for (i, (key, val)) in pairs.iter().enumerate() {
-                        // Try to show full key, fall back to short
-                        let key_str = format_value_full(key, thresholds.key)
-                            .unwrap_or_else(|| format_value_short(key));
-                        let mut child_path = path.clone();
-                        child_path.push(format!("{}", i));
-                        let child_diff = diff.get(&child_path);
+                    // Group entries by change status
+                    let groups = group_by_change_status(pairs.len(), diff, &path);
+                    let pairs_vec: Vec<_> = pairs.iter().collect();
 
-                        // Try to format value fully inline
-                        let val_full = format_value_full(val, thresholds.value);
-                        let can_inline = val_full.is_some();
-                        let val_display = val_full.unwrap_or_else(|| format_value_short(val));
+                    // Check if any entries are changed - only use collapsing syntax if there's a mix
+                    let has_any_changed = groups.iter().any(|(_, _, is_changed)| *is_changed);
 
-                        let marker = diff_marker(child_diff);
-                        let entry_text = if can_inline {
-                            // Simple value, no icon needed
-                            format!("{}  {}{} -> {}", indent, marker, key_str, val_display)
+                    for (start, group_count, is_changed) in groups {
+                        if has_any_changed && !is_changed && group_count >= collapse_threshold && group_count >= 3 {
+                            // Create unique path for this collapsed group
+                            let mut group_path = path.clone();
+                            group_path.push(format!("__collapsed_{}_{}", start, start + group_count - 1));
+
+                            let group_expanded = expansion.is_expanded(&group_path);
+
+                            if group_expanded {
+                                // Show entries individually
+                                for i in start..(start + group_count) {
+                                    let (key, val) = pairs_vec[i];
+                                    let key_str = format_value_full(key, thresholds.key)
+                                        .unwrap_or_else(|| format_value_short(key));
+                                    let mut child_path = path.clone();
+                                    child_path.push(format!("{}", i));
+                                    let child_diff = diff.get(&child_path);
+
+                                    let val_full = format_value_full(val, thresholds.value);
+                                    let can_inline = val_full.is_some();
+                                    let val_display = val_full.unwrap_or_else(|| format_value_short(val));
+
+                                    let marker = diff_marker(child_diff);
+                                    let entry_text = if can_inline {
+                                        format!("{}  {}{} -> {}", indent, marker, key_str, val_display)
+                                    } else {
+                                        let entry_icon = if expansion.is_expanded(&child_path) { "▼" } else { "▶" };
+                                        format!("{}  {}{} {} -> {}", indent, marker, entry_icon, key_str, val_display)
+                                    };
+
+                                    lines.push(TreeLine::with_default_spans(child_path.clone(), entry_text, !can_inline, child_diff));
+
+                                    if !can_inline && expansion.is_expanded(&child_path) {
+                                        let child_lines = render_value_children(val, child_path, expansion, diff, depth + 2, terminal_width, collapse_threshold);
+                                        lines.extend(child_lines);
+                                    }
+                                }
+                            } else {
+                                // Show collapsed summary (expandable)
+                                let icon = "▶";
+                                let summary_text = format!("{}  {} ... ({} unchanged entries)", indent, icon, group_count);
+                                lines.push(TreeLine::with_default_spans(group_path, summary_text, true, DiffKind::Unchanged));
+                            }
                         } else {
-                            // Complex value, show expand icon
-                            let entry_icon = if expansion.is_expanded(&child_path) { "▼" } else { "▶" };
-                            format!("{}  {}{} {} -> {}", indent, marker, entry_icon, key_str, val_display)
-                        };
+                            // Show entries individually
+                            for i in start..(start + group_count) {
+                                let (key, val) = pairs_vec[i];
+                                // Try to show full key, fall back to short
+                                let key_str = format_value_full(key, thresholds.key)
+                                    .unwrap_or_else(|| format_value_short(key));
+                                let mut child_path = path.clone();
+                                child_path.push(format!("{}", i));
+                                let child_diff = diff.get(&child_path);
 
-                        lines.push(TreeLine::with_default_spans(child_path.clone(), entry_text, !can_inline, child_diff));
+                                // Try to format value fully inline
+                                let val_full = format_value_full(val, thresholds.value);
+                                let can_inline = val_full.is_some();
+                                let val_display = val_full.unwrap_or_else(|| format_value_short(val));
 
-                        // If value can't be inlined and this entry is expanded, show children
-                        if !can_inline && expansion.is_expanded(&child_path) {
-                            // Render value's children directly (skip the value's own header)
-                            let child_lines = render_value_children(val, child_path, expansion, diff, depth + 2, terminal_width);
-                            lines.extend(child_lines);
+                                let marker = diff_marker(child_diff);
+                                let entry_text = if can_inline {
+                                    // Simple value, no icon needed
+                                    format!("{}  {}{} -> {}", indent, marker, key_str, val_display)
+                                } else {
+                                    // Complex value, show expand icon
+                                    let entry_icon = if expansion.is_expanded(&child_path) { "▼" } else { "▶" };
+                                    format!("{}  {}{} {} -> {}", indent, marker, entry_icon, key_str, val_display)
+                                };
+
+                                lines.push(TreeLine::with_default_spans(child_path.clone(), entry_text, !can_inline, child_diff));
+
+                                // If value can't be inlined and this entry is expanded, show children
+                                if !can_inline && expansion.is_expanded(&child_path) {
+                                    // Render value's children directly (skip the value's own header)
+                                    let child_lines = render_value_children(val, child_path, expansion, diff, depth + 2, terminal_width, collapse_threshold);
+                                    lines.extend(child_lines);
+                                }
+                            }
                         }
                     }
+
                     // Add closing paren
                     let close_text = format!("{})", indent);
                     lines.push(TreeLine::with_default_spans(path.clone(), close_text, false, diff_kind));
@@ -446,12 +503,46 @@ pub fn render_value(
                 let mut lines = vec![TreeLine::with_default_spans(path.clone(), text, true, diff_kind)];
 
                 if expanded {
-                    // Show each item without index (sets are unordered)
-                    for (i, item) in items.iter().enumerate() {
-                        let mut child_path = path.clone();
-                        child_path.push(format!("{}", i));
-                        lines.extend(render_value("", item, child_path, expansion, diff, depth + 1, terminal_width));
+                    // Group items by change status
+                    let groups = group_by_change_status(count, diff, &path);
+                    let items_vec: Vec<_> = items.iter().collect();
+
+                    // Check if any items are changed - only use collapsing syntax if there's a mix
+                    let has_any_changed = groups.iter().any(|(_, _, is_changed)| *is_changed);
+
+                    for (start, group_count, is_changed) in groups {
+                        if has_any_changed && !is_changed && group_count >= collapse_threshold && group_count >= 3 {
+                            // Create unique path for this collapsed group
+                            let mut group_path = path.clone();
+                            group_path.push(format!("__collapsed_{}_{}", start, start + group_count - 1));
+
+                            let group_expanded = expansion.is_expanded(&group_path);
+
+                            if group_expanded {
+                                // Show items individually
+                                for i in start..(start + group_count) {
+                                    let item = items_vec[i];
+                                    let mut child_path = path.clone();
+                                    child_path.push(format!("{}", i));
+                                    lines.extend(render_value("", item, child_path, expansion, diff, depth + 1, terminal_width, collapse_threshold));
+                                }
+                            } else {
+                                // Show collapsed summary (expandable)
+                                let icon = "▶";
+                                let summary_text = format!("{}  {} ... ({} unchanged)", indent, icon, group_count);
+                                lines.push(TreeLine::with_default_spans(group_path, summary_text, true, DiffKind::Unchanged));
+                            }
+                        } else {
+                            // Show items individually
+                            for i in start..(start + group_count) {
+                                let item = items_vec[i];
+                                let mut child_path = path.clone();
+                                child_path.push(format!("{}", i));
+                                lines.extend(render_value("", item, child_path, expansion, diff, depth + 1, terminal_width, collapse_threshold));
+                            }
+                        }
                     }
+
                     // Add closing paren
                     let close_text = format!("{})", indent);
                     lines.push(TreeLine::with_default_spans(path.clone(), close_text, false, diff_kind));
@@ -485,12 +576,45 @@ pub fn render_value(
                 let mut lines = vec![TreeLine::with_default_spans(path.clone(), text, true, diff_kind)];
 
                 if expanded {
-                    // Lists keep indexes since order matters
-                    for (i, item) in items.iter().enumerate() {
-                        let mut child_path = path.clone();
-                        child_path.push(format!("{}", i));
-                        lines.extend(render_value(&format!("[{}]", i), item, child_path, expansion, diff, depth + 1, terminal_width));
+                    // Group items by change status
+                    let groups = group_by_change_status(items.len(), diff, &path);
+
+                    // Check if any items are changed - only use collapsing syntax if there's a mix
+                    let has_any_changed = groups.iter().any(|(_, _, is_changed)| *is_changed);
+
+                    for (start, group_count, is_changed) in groups {
+                        if has_any_changed && !is_changed && group_count >= collapse_threshold && group_count >= 3 {
+                            // Create unique path for this collapsed group
+                            let mut group_path = path.clone();
+                            group_path.push(format!("__collapsed_{}_{}", start, start + group_count - 1));
+
+                            let group_expanded = expansion.is_expanded(&group_path);
+
+                            if group_expanded {
+                                // Show items individually
+                                for i in start..(start + group_count) {
+                                    let item = &items[i];
+                                    let mut child_path = path.clone();
+                                    child_path.push(format!("{}", i));
+                                    lines.extend(render_value(&format!("[{}]", i), item, child_path, expansion, diff, depth + 1, terminal_width, collapse_threshold));
+                                }
+                            } else {
+                                // Show collapsed summary (expandable)
+                                let icon = "▶";
+                                let summary_text = format!("{}  {} ... ([{}..{}] {} unchanged)", indent, icon, start, start + group_count - 1, group_count);
+                                lines.push(TreeLine::with_default_spans(group_path, summary_text, true, DiffKind::Unchanged));
+                            }
+                        } else {
+                            // Show items individually (lists keep indexes since order matters)
+                            for i in start..(start + group_count) {
+                                let item = &items[i];
+                                let mut child_path = path.clone();
+                                child_path.push(format!("{}", i));
+                                lines.extend(render_value(&format!("[{}]", i), item, child_path, expansion, diff, depth + 1, terminal_width, collapse_threshold));
+                            }
+                        }
                     }
+
                     // Add closing bracket
                     let close_text = format!("{}]", indent);
                     lines.push(TreeLine::with_default_spans(path.clone(), close_text, false, diff_kind));
@@ -524,11 +648,46 @@ pub fn render_value(
                 let mut lines = vec![TreeLine::with_default_spans(path.clone(), text, true, diff_kind)];
 
                 if expanded {
-                    for (i, item) in items.iter().enumerate() {
-                        let mut child_path = path.clone();
-                        child_path.push(format!("{}", i));
-                        lines.extend(render_value(&format!("[{}]", i), item, child_path, expansion, diff, depth + 1, terminal_width));
+                    // Group items by change status
+                    let groups = group_by_change_status(items.len(), diff, &path);
+                    let items_vec: Vec<_> = items.iter().collect();
+
+                    // Check if any items are changed - only use collapsing syntax if there's a mix
+                    let has_any_changed = groups.iter().any(|(_, _, is_changed)| *is_changed);
+
+                    for (start, group_count, is_changed) in groups {
+                        if has_any_changed && !is_changed && group_count >= collapse_threshold && group_count >= 3 {
+                            // Create unique path for this collapsed group
+                            let mut group_path = path.clone();
+                            group_path.push(format!("__collapsed_{}_{}", start, start + group_count - 1));
+
+                            let group_expanded = expansion.is_expanded(&group_path);
+
+                            if group_expanded {
+                                // Show items individually
+                                for i in start..(start + group_count) {
+                                    let item = items_vec[i];
+                                    let mut child_path = path.clone();
+                                    child_path.push(format!("{}", i));
+                                    lines.extend(render_value(&format!("[{}]", i), item, child_path, expansion, diff, depth + 1, terminal_width, collapse_threshold));
+                                }
+                            } else {
+                                // Show collapsed summary (expandable)
+                                let icon = "▶";
+                                let summary_text = format!("{}  {} ... ([{}..{}] {} unchanged)", indent, icon, start, start + group_count - 1, group_count);
+                                lines.push(TreeLine::with_default_spans(group_path, summary_text, true, DiffKind::Unchanged));
+                            }
+                        } else {
+                            // Show items individually
+                            for i in start..(start + group_count) {
+                                let item = items_vec[i];
+                                let mut child_path = path.clone();
+                                child_path.push(format!("{}", i));
+                                lines.extend(render_value(&format!("[{}]", i), item, child_path, expansion, diff, depth + 1, terminal_width, collapse_threshold));
+                            }
+                        }
                     }
+
                     // Add closing paren
                     let close_text = format!("{})", indent);
                     lines.push(TreeLine::with_default_spans(path.clone(), close_text, false, diff_kind));
@@ -553,6 +712,7 @@ fn render_value_children(
     diff: &DiffResult,
     depth: usize,
     terminal_width: usize,
+    collapse_threshold: usize,
 ) -> Vec<TreeLine> {
     let thresholds = DisplayThresholds::new(terminal_width, depth);
 
@@ -562,25 +722,97 @@ fn render_value_children(
             for (field_name, field_value) in fields.iter() {
                 let mut field_path = path.clone();
                 field_path.push(field_name.clone());
-                lines.extend(render_value(field_name, field_value, field_path, expansion, diff, depth, terminal_width));
+                lines.extend(render_value(field_name, field_value, field_path, expansion, diff, depth, terminal_width, collapse_threshold));
             }
             lines
         }
         itf::Value::Set(items) => {
             let mut lines = Vec::new();
-            for (i, item) in items.iter().enumerate() {
-                let mut item_path = path.clone();
-                item_path.push(format!("{}", i));
-                lines.extend(render_value("", item, item_path, expansion, diff, depth, terminal_width));
+            let count = items.iter().count();
+
+            // Group items by change status and apply collapsing
+            let groups = group_by_change_status(count, diff, &path);
+            let items_vec: Vec<_> = items.iter().collect();
+            let indent = "  ".repeat(depth);
+
+            // Check if any items are changed - only use collapsing syntax if there's a mix
+            let has_any_changed = groups.iter().any(|(_, _, is_changed)| *is_changed);
+
+            for (start, group_count, is_changed) in groups {
+                if has_any_changed && !is_changed && group_count >= collapse_threshold && group_count >= 3 {
+                    // Create unique path for this collapsed group
+                    let mut group_path = path.clone();
+                    group_path.push(format!("__collapsed_{}_{}", start, start + group_count - 1));
+
+                    let group_expanded = expansion.is_expanded(&group_path);
+
+                    if group_expanded {
+                        // Show items individually
+                        for i in start..(start + group_count) {
+                            let item = items_vec[i];
+                            let mut item_path = path.clone();
+                            item_path.push(format!("{}", i));
+                            lines.extend(render_value("", item, item_path, expansion, diff, depth, terminal_width, collapse_threshold));
+                        }
+                    } else {
+                        // Show collapsed summary (expandable)
+                        let icon = "▶";
+                        let summary_text = format!("{}{}... ({} unchanged)", indent, icon, group_count);
+                        lines.push(TreeLine::with_default_spans(group_path, summary_text, true, DiffKind::Unchanged));
+                    }
+                } else {
+                    // Show items individually
+                    for i in start..(start + group_count) {
+                        let item = items_vec[i];
+                        let mut item_path = path.clone();
+                        item_path.push(format!("{}", i));
+                        lines.extend(render_value("", item, item_path, expansion, diff, depth, terminal_width, collapse_threshold));
+                    }
+                }
             }
             lines
         }
         itf::Value::List(items) => {
             let mut lines = Vec::new();
-            for (i, item) in items.iter().enumerate() {
-                let mut item_path = path.clone();
-                item_path.push(format!("{}", i));
-                lines.extend(render_value(&format!("[{}]", i), item, item_path, expansion, diff, depth, terminal_width));
+            let indent = "  ".repeat(depth);
+
+            // Group items by change status and apply collapsing
+            let groups = group_by_change_status(items.len(), diff, &path);
+
+            // Check if any items are changed - only use collapsing syntax if there's a mix
+            let has_any_changed = groups.iter().any(|(_, _, is_changed)| *is_changed);
+
+            for (start, group_count, is_changed) in groups {
+                if has_any_changed && !is_changed && group_count >= collapse_threshold && group_count >= 3 {
+                    // Create unique path for this collapsed group
+                    let mut group_path = path.clone();
+                    group_path.push(format!("__collapsed_{}_{}", start, start + group_count - 1));
+
+                    let group_expanded = expansion.is_expanded(&group_path);
+
+                    if group_expanded {
+                        // Show items individually
+                        for i in start..(start + group_count) {
+                            let item = &items[i];
+                            let mut item_path = path.clone();
+                            item_path.push(format!("{}", i));
+                            lines.extend(render_value(&format!("[{}]", i), item, item_path, expansion, diff, depth, terminal_width, collapse_threshold));
+                        }
+                    } else {
+                        // Show collapsed summary (expandable)
+                        let icon = "▶";
+                        let summary_text = format!("{}{}... ([{}..{}] {} unchanged)", indent, icon, start, start + group_count - 1, group_count);
+                        lines.push(TreeLine::with_default_spans(group_path, summary_text, true, DiffKind::Unchanged));
+                    }
+                } else {
+                    // Show items individually
+                    for i in start..(start + group_count) {
+                        let item = &items[i];
+                        let mut item_path = path.clone();
+                        item_path.push(format!("{}", i));
+                        lines.extend(render_value(&format!("[{}]", i), item, item_path, expansion, diff, depth, terminal_width, collapse_threshold));
+                    }
+                }
             }
             lines
         }
@@ -603,17 +835,53 @@ fn render_value_children(
                 lines.push(TreeLine::with_default_spans(entry_path.clone(), text, !can_inline, entry_diff));
 
                 if !can_inline && expansion.is_expanded(&entry_path) {
-                    lines.extend(render_value_children(v, entry_path, expansion, diff, depth + 1, terminal_width));
+                    lines.extend(render_value_children(v, entry_path, expansion, diff, depth + 1, terminal_width, collapse_threshold));
                 }
             }
             lines
         }
         itf::Value::Tuple(items) => {
             let mut lines = Vec::new();
-            for (i, item) in items.iter().enumerate() {
-                let mut item_path = path.clone();
-                item_path.push(format!("{}", i));
-                lines.extend(render_value(&format!("[{}]", i), item, item_path, expansion, diff, depth, terminal_width));
+            let indent = "  ".repeat(depth);
+
+            // Group items by change status and apply collapsing
+            let groups = group_by_change_status(items.len(), diff, &path);
+            let items_vec: Vec<_> = items.iter().collect();
+
+            // Check if any items are changed - only use collapsing syntax if there's a mix
+            let has_any_changed = groups.iter().any(|(_, _, is_changed)| *is_changed);
+
+            for (start, group_count, is_changed) in groups {
+                if has_any_changed && !is_changed && group_count >= collapse_threshold && group_count >= 3 {
+                    // Create unique path for this collapsed group
+                    let mut group_path = path.clone();
+                    group_path.push(format!("__collapsed_{}_{}", start, start + group_count - 1));
+
+                    let group_expanded = expansion.is_expanded(&group_path);
+
+                    if group_expanded {
+                        // Show items individually
+                        for i in start..(start + group_count) {
+                            let item = items_vec[i];
+                            let mut item_path = path.clone();
+                            item_path.push(format!("{}", i));
+                            lines.extend(render_value(&format!("[{}]", i), item, item_path, expansion, diff, depth, terminal_width, collapse_threshold));
+                        }
+                    } else {
+                        // Show collapsed summary (expandable)
+                        let icon = "▶";
+                        let summary_text = format!("{}{}... ([{}..{}] {} unchanged)", indent, icon, start, start + group_count - 1, group_count);
+                        lines.push(TreeLine::with_default_spans(group_path, summary_text, true, DiffKind::Unchanged));
+                    }
+                } else {
+                    // Show items individually
+                    for i in start..(start + group_count) {
+                        let item = items_vec[i];
+                        let mut item_path = path.clone();
+                        item_path.push(format!("{}", i));
+                        lines.extend(render_value(&format!("[{}]", i), item, item_path, expansion, diff, depth, terminal_width, collapse_threshold));
+                    }
+                }
             }
             lines
         }
@@ -780,4 +1048,49 @@ fn format_collection_inline<'a>(
 /// Check if all items in a collection are simple
 fn all_simple<'a>(items: impl Iterator<Item = &'a itf::Value>) -> bool {
     items.fold(true, |acc, v| acc && is_simple(v))
+}
+
+/// Group items by change status, collapsing consecutive unchanged items
+/// Returns (start_index, count, is_changed) for each group
+fn group_by_change_status(total_count: usize, diff: &DiffResult, base_path: &NodePath) -> Vec<(usize, usize, bool)> {
+    if total_count == 0 {
+        return vec![];
+    }
+
+    let mut groups = Vec::new();
+    let mut current_start = 0;
+    let mut current_count = 0;
+    let mut current_changed = {
+        let mut path = base_path.clone();
+        path.push("0".to_string());
+        let kind = diff.get(&path);
+        kind == DiffKind::Added || kind == DiffKind::Removed || kind == DiffKind::Modified
+    };
+
+    for i in 0..total_count {
+        let mut item_path = base_path.clone();
+        item_path.push(format!("{}", i));
+        let kind = diff.get(&item_path);
+        let is_changed = kind == DiffKind::Added || kind == DiffKind::Removed || kind == DiffKind::Modified;
+
+        if is_changed == current_changed {
+            // Continue current group
+            current_count += 1;
+        } else {
+            // Save current group and start new one
+            if current_count > 0 {
+                groups.push((current_start, current_count, current_changed));
+            }
+            current_start = i;
+            current_count = 1;
+            current_changed = is_changed;
+        }
+    }
+
+    // Save last group
+    if current_count > 0 {
+        groups.push((current_start, current_count, current_changed));
+    }
+
+    groups
 }

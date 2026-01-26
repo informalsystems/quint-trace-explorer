@@ -37,6 +37,7 @@ pub struct App {
     pub scroll_offset: usize,  // First visible line
     pub auto_expand: bool,  // Auto-expand changed variables on state navigation
     pub view_mode: ViewMode,
+    pub collapse_threshold: usize,  // Dynamic threshold for collapsing unchanged items
 }
 
 impl App {
@@ -50,6 +51,7 @@ impl App {
             scroll_offset: 0,
             auto_expand,
             view_mode: ViewMode::Single,
+            collapse_threshold: 1,  // Start with completely collapsed (hide all unchanged)
         }
     }
 
@@ -95,65 +97,65 @@ impl App {
 }
 
 /// Auto-adjust expansion to fill available vertical space
-/// Uses level-by-level expansion with backtracking
+/// Three-phase strategy: completely collapsed → partially collapsed → uncollapsed
 fn auto_adjust_expansion(app: &mut App, terminal_width: usize, viewport_height: usize) {
     let diff = compute_diff_for_state(&app);
     let changed_paths: Vec<_> = diff.changes.keys().cloned().collect();
 
-    // Save the initial state (everything collapsed by auto-expansion)
+    // Phase 1: Completely collapsed (threshold=1) - expand depth while hiding ALL unchanged
+    app.collapse_threshold = 1;
     let mut last_good_snapshot = app.expansion.snapshot();
 
-    // Iterate through depth levels
-    const MAX_DEPTH: usize = 20; // Reasonable maximum depth
+    const MAX_DEPTH: usize = 20;
     for depth in 1..=MAX_DEPTH {
-        // Get current state
-        let lines = build_tree_lines(&app, &diff, terminal_width);
+        let lines = build_tree_lines(&app, &diff, terminal_width, app.collapse_threshold);
         let current_count = lines.len();
 
-        // Check if we've filled enough of the viewport (leave small buffer)
         if current_count >= viewport_height.saturating_sub(3) {
-            // We've filled the viewport, stop here
             break;
         }
 
-        // Get all expandable paths
         let all_expandable: Vec<_> = lines.iter()
             .filter(|l| l.expandable)
             .map(|l| l.path.clone())
             .collect();
 
-        // Check if there are any items at this depth to expand
         let has_items_at_depth = all_expandable.iter().any(|p| p.len() == depth);
         if !has_items_at_depth {
-            // No more items at this depth, continue to next depth
             continue;
         }
 
-        // Try expanding all items at this depth (changed items first)
-        let changed = app.expansion.expand_level(
-            &all_expandable,
-            &changed_paths,
-            depth,
-        );
-
+        let changed = app.expansion.expand_level(&all_expandable, &changed_paths, depth);
         if !changed {
-            // Nothing was expanded at this level, move to next depth
             continue;
         }
 
-        // Re-render to check if we overflowed
-        let lines = build_tree_lines(&app, &diff, terminal_width);
-        let new_count = lines.len();
-
-        if new_count > viewport_height {
-            // We overflowed! Backtrack to previous good state
+        let lines = build_tree_lines(&app, &diff, terminal_width, app.collapse_threshold);
+        if lines.len() > viewport_height {
             app.expansion.restore(&last_good_snapshot);
             break;
-        } else {
-            // This level fits! Save it as the last good state (after expansion)
-            last_good_snapshot = app.expansion.snapshot();
         }
+
+        last_good_snapshot = app.expansion.snapshot();
     }
+
+    // Phase 2: Try partially collapsed (threshold=3) with same expansion
+    let lines = build_tree_lines(&app, &diff, terminal_width, 3);
+    if lines.len() <= viewport_height.saturating_sub(5) {
+        // Fits with more detail! Use threshold 3
+        app.collapse_threshold = 3;
+    } else {
+        // Doesn't fit, stick with threshold 1
+        return;
+    }
+
+    // Phase 3: Try uncollapsed (threshold=MAX) with same expansion
+    let lines = build_tree_lines(&app, &diff, terminal_width, usize::MAX);
+    if lines.len() <= viewport_height.saturating_sub(5) {
+        // Fits with full detail! Use no collapsing
+        app.collapse_threshold = usize::MAX;
+    }
+    // Otherwise stick with threshold 3
 }
 
 /// Run the TUI application
@@ -192,7 +194,7 @@ pub fn run(trace: Trace, auto_expand: bool) -> Result<()> {
         let (tree_lines, line_count, all_expandable_paths) = match app.view_mode {
             ViewMode::Single => {
                 let diff = compute_diff_for_state(&app);
-                let lines = build_tree_lines(&app, &diff, terminal_width);
+                let lines = build_tree_lines(&app, &diff, terminal_width, app.collapse_threshold);
                 let count = lines.len();
                 let paths: Vec<_> = lines.iter()
                     .filter(|l| l.expandable)
@@ -201,11 +203,11 @@ pub fn run(trace: Trace, auto_expand: bool) -> Result<()> {
                 (lines, count, paths)
             }
             ViewMode::Diff { left, right, focus } => {
-                // In diff mode, use focused panel's lines for navigation
+                // In diff mode, use focused panel's lines for navigation (no collapsing in diff mode)
                 let empty_diff = DiffResult { changes: std::collections::HashMap::new() };
                 let panel_width = terminal_width / 2;
-                let left_lines = build_tree_lines_for_state(&app.trace, left, &app.expansion, &empty_diff, panel_width);
-                let right_lines = build_tree_lines_for_state(&app.trace, right, &app.expansion, &empty_diff, panel_width);
+                let left_lines = build_tree_lines_for_state(&app.trace, left, &app.expansion, &empty_diff, panel_width, usize::MAX);
+                let right_lines = build_tree_lines_for_state(&app.trace, right, &app.expansion, &empty_diff, panel_width, usize::MAX);
 
                 // Use focused panel for cursor navigation
                 let focused_lines = match focus {
@@ -533,7 +535,7 @@ fn handle_content_click(app: &mut App, row: usize, col: usize, ctx: &EventContex
                 let clicked_line = app.scroll_offset + (row - 3);
                 let empty_diff = DiffResult { changes: std::collections::HashMap::new() };
                 let state_idx = if new_focus == DiffFocus::Left { left } else { right };
-                let panel_lines = build_tree_lines_for_state(&app.trace, state_idx, &app.expansion, &empty_diff, half_width);
+                let panel_lines = build_tree_lines_for_state(&app.trace, state_idx, &app.expansion, &empty_diff, half_width, usize::MAX);
 
                 if clicked_line < panel_lines.len() {
                     app.cursor = clicked_line;
@@ -573,13 +575,13 @@ fn auto_expand_changes(app: &mut App) {
 }
 
 /// Build tree lines for the current state
-fn build_tree_lines(app: &App, diff: &DiffResult, terminal_width: usize) -> Vec<TreeLine> {
+fn build_tree_lines(app: &App, diff: &DiffResult, terminal_width: usize, collapse_threshold: usize) -> Vec<TreeLine> {
     let mut tree_lines = Vec::new();
     if let Some(state) = app.trace.states.get(app.current_state) {
         for name in &app.trace.vars {
             if let Some(value) = state.values.get(name) {
                 let path = vec![name.clone()];
-                tree_lines.extend(render_value(name, value, path, &app.expansion, diff, 0, terminal_width));
+                tree_lines.extend(render_value(name, value, path, &app.expansion, diff, 0, terminal_width, collapse_threshold));
             }
         }
     }
@@ -766,13 +768,14 @@ fn build_tree_lines_for_state(
     expansion: &ExpansionState,
     diff: &DiffResult,
     terminal_width: usize,
+    collapse_threshold: usize,
 ) -> Vec<TreeLine> {
     let mut tree_lines = Vec::new();
     if let Some(state) = trace.states.get(state_idx) {
         for name in &trace.vars {
             if let Some(value) = state.values.get(name) {
                 let path = vec![name.clone()];
-                tree_lines.extend(render_value(name, value, path, expansion, diff, 0, terminal_width));
+                tree_lines.extend(render_value(name, value, path, expansion, diff, 0, terminal_width, collapse_threshold));
             }
         }
     }
@@ -823,8 +826,8 @@ fn render_diff(
     let empty_diff = DiffResult { changes: std::collections::HashMap::new() };
 
     // Build tree lines for each side
-    let left_lines = build_tree_lines_for_state(&app.trace, left_idx, &app.expansion, &empty_diff, panel_width.saturating_sub(4));
-    let right_lines = build_tree_lines_for_state(&app.trace, right_idx, &app.expansion, &diff_left_to_right, panel_width.saturating_sub(4));
+    let left_lines = build_tree_lines_for_state(&app.trace, left_idx, &app.expansion, &empty_diff, panel_width.saturating_sub(4), usize::MAX);
+    let right_lines = build_tree_lines_for_state(&app.trace, right_idx, &app.expansion, &diff_left_to_right, panel_width.saturating_sub(4), usize::MAX);
 
     // Split layout: header + two panels side by side
     let main_chunks = Layout::default()
