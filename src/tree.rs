@@ -328,7 +328,7 @@ pub fn render_value(
             let count = items.iter().count();
             let all_simple = all_simple(items.iter());
             let inline = if all_simple {
-                format_collection_inline(items.iter(), "{ ", " }", thresholds.inline)
+                format_collection_inline(items.iter(), "Set(", ")", thresholds.inline)
             } else {
                 None
             };
@@ -558,7 +558,7 @@ fn format_value_short(value: &itf::Value) -> String {
         itf::Value::BigInt(n) => n.to_string(),
         itf::Value::Record(_) => "{ ... }".to_string(),
         itf::Value::Map(_) => "Map(...)".to_string(),
-        itf::Value::Set(_) => "{ ... }".to_string(),
+        itf::Value::Set(_) => "Set(...)".to_string(),
         itf::Value::List(_) => "[...]".to_string(),
         itf::Value::Tuple(items) => {
             if items.is_empty() {
@@ -613,7 +613,11 @@ fn format_value_full(value: &itf::Value, max_len: usize) -> Option<String> {
             if parts.len() != items.iter().count() {
                 return None;
             }
-            format!("{{ {} }}", parts.join(", "))
+            if parts.is_empty() {
+                "Set()".to_string()
+            } else {
+                format!("Set({})", parts.join(", "))
+            }
         }
         itf::Value::List(items) => {
             let parts: Vec<String> = items
