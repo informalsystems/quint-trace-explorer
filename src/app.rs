@@ -509,9 +509,11 @@ fn auto_expand_changes(app: &mut App) {
 fn build_tree_lines(app: &App, diff: &DiffResult, terminal_width: usize) -> Vec<TreeLine> {
     let mut tree_lines = Vec::new();
     if let Some(state) = app.trace.states.get(app.current_state) {
-        for (name, value) in &state.values {
-            let path = vec![name.clone()];
-            tree_lines.extend(render_value(name, value, path, &app.expansion, diff, 0, terminal_width));
+        for name in &app.trace.vars {
+            if let Some(value) = state.values.get(name) {
+                let path = vec![name.clone()];
+                tree_lines.extend(render_value(name, value, path, &app.expansion, diff, 0, terminal_width));
+            }
         }
     }
     tree_lines
@@ -700,9 +702,11 @@ fn build_tree_lines_for_state(
 ) -> Vec<TreeLine> {
     let mut tree_lines = Vec::new();
     if let Some(state) = trace.states.get(state_idx) {
-        for (name, value) in &state.values {
-            let path = vec![name.clone()];
-            tree_lines.extend(render_value(name, value, path, expansion, diff, 0, terminal_width));
+        for name in &trace.vars {
+            if let Some(value) = state.values.get(name) {
+                let path = vec![name.clone()];
+                tree_lines.extend(render_value(name, value, path, expansion, diff, 0, terminal_width));
+            }
         }
     }
     tree_lines
