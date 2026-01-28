@@ -18,7 +18,7 @@ struct Args {
     trace_file: PathBuf,
 
     /// Auto-expand changed variables when navigating between states
-    #[arg(short, long)]
+    #[arg(short, long, default_value_t = true)]
     auto_expand: bool,
 }
 
