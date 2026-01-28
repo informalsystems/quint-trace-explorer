@@ -1,5 +1,5 @@
 {
-  description = "Quint Trace Explorer development setup";
+  description = "Quint Trace Explorer";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
@@ -21,8 +21,36 @@
         rustToolchain = pkgs.rust-bin.stable.latest.default.override {
           extensions = [ "rust-src" "rust-analyzer" "clippy" "rustfmt" ];
         };
+
+        rustPlatform = pkgs.makeRustPlatform {
+          cargo = rustToolchain;
+          rustc = rustToolchain;
+        };
       in
       {
+        packages.default = rustPlatform.buildRustPackage {
+          pname = "quint-trace-explorer";
+          version = "0.1.0";
+
+          src = ./.;
+
+          cargoLock = {
+            lockFile = ./Cargo.lock;
+          };
+
+          meta = with pkgs.lib; {
+            description = "Interactive CLI tool for exploring Quint/Apalache ITF traces";
+            homepage = "https://github.com/informalsystems/quint-trace-explorer";
+            license = licenses.asl20;
+            maintainers = [ ];
+          };
+        };
+
+        apps.default = {
+          type = "app";
+          program = "${self.packages.${system}.default}/bin/quint-trace-explorer";
+        };
+
         devShells.default = pkgs.mkShell {
           buildInputs = with pkgs; [
             rustToolchain
