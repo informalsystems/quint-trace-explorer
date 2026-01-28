@@ -10,6 +10,80 @@ An interactive CLI tool to navigate, inspect, and debug ITF traces produced by Q
 
 The main goal is to make it easier to see what has changed from one state to another in a trace. We optimize the usage of available space (vertical and horizontal) to best show the changes, collapsing sub-trees that are unchanged (unless there is spare space).
 
+## Requirements
+
+- Rust 1.70 or later (2021 edition) - not needed if using Nix
+- A terminal emulator with Unicode support
+
+## Installation
+
+### Using Nix
+
+If you have Nix with flakes enabled:
+
+```bash
+nix run github:informalsystems/quint-trace-explorer -- <trace-file.itf.json>
+```
+
+### Using Cargo
+
+```bash
+# Install from source
+git clone https://github.com/informalsystems/quint-trace-explorer.git
+cd quint-trace-explorer
+cargo build --release
+
+# Run the tool
+./target/release/quint-trace-explorer <trace-file.itf.json>
+```
+
+## Usage
+
+### Generating ITF Traces
+
+First, generate an ITF trace from your Quint specification using one of these commands:
+
+```bash
+# Generate a trace with a single random execution
+quint run file.qnt --max-samples=1 --out-itf=trace.itf.json
+```
+
+All these commands support ITF output:
+``` bash
+quint run file.qnt --out-itf=trace.itf.json
+
+quint test file.qnt --out-itf=trace.itf.json
+
+quint verify file.qnt --out-itf=trace.itf.json
+```
+
+### Exploring Traces
+
+Basic usage:
+
+```bash
+quint-trace-explorer <path-to-trace.itf.json>
+```
+
+If running from the repository (not installed):
+
+```bash
+cargo run -- <path-to-trace.itf.json>
+```
+
+Try it with one of the included examples:
+
+```bash
+# Using installed binary
+quint-trace-explorer examples/tendermint.itf.json
+
+# Or from repository
+cargo run -- examples/clock.itf.json
+cargo run -- examples/consensus.itf.json
+```
+
+Once running, use the keyboard navigation (see below) or your mouse to explore states and inspect values.
+
 ## Demo
 
 TODO: video
