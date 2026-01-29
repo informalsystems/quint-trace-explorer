@@ -48,6 +48,13 @@ First, generate an ITF trace from your Quint specification using one of these co
 quint run file.qnt --max-samples=1 --out-itf=trace.itf.json
 ```
 
+This tool is particularly useful for investigating problematic executions, such as when an invariant is violated. The trace will show you the sequence of states leading to the violation.
+
+```bash
+# Generate a trace checking an invariant (useful for investigating violations)
+quint run file.qnt --invariant=myInvariant --out-itf=trace.itf.json
+```
+
 All these commands support ITF output:
 ``` bash
 quint run file.qnt --out-itf=trace.itf.json
@@ -149,5 +156,6 @@ ITF is a JSON-based trace format. See [ADR-015](https://apalache-mc.org/docs/adr
 |-------------|---------------------------------|
 | `/`         | Search/filter states            |
 | `v`         | Toggle variable visibility menu |
+| `d`         | Toggle side-by-side state view  |
 | `q` / `Esc` | Quit                            |
 
