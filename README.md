@@ -10,6 +10,11 @@ An interactive CLI tool to navigate, inspect, and debug ITF traces produced by Q
 
 The main goal is to make it easier to see what has changed from one state to another in a trace. We optimize the usage of available space (vertical and horizontal) to best show the changes, collapsing sub-trees that are unchanged (unless there is spare space).
 
+## Demo
+
+<video autoPlay
+src="https://github.com/user-attachments/assets/c52aef8a-f721-4ea3-85ca-6d4b88c2657d"></video>
+
 ## Requirements
 
 - Rust 1.70 or later (2021 edition) - not needed if using Nix
@@ -90,11 +95,6 @@ cargo run -- examples/consensus.itf.json
 ```
 
 Once running, use the keyboard navigation (see below) or your mouse to explore states and inspect values.
-
-## Demo
-
-<video autoPlay
-src="https://github.com/user-attachments/assets/c52aef8a-f721-4ea3-85ca-6d4b88c2657d"></video>
 
 ## ITF Format Reference
 
