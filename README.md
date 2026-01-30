@@ -93,7 +93,8 @@ Once running, use the keyboard navigation (see below) or your mouse to explore s
 
 ## Demo
 
-TODO: video
+<video autoPlay
+src="https://github.com/user-attachments/assets/c52aef8a-f721-4ea3-85ca-6d4b88c2657d"></video>
 
 ## ITF Format Reference
 
